@@ -1,0 +1,28 @@
+build/
+cmake-build-*/
+.cache/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+
+# Conan
+conan.lock
+conanbuildinfo*
+conaninfo.txt
+graph_info.json
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test output
+*.log
+core
+core.*
+
+# koorma dev scratch
+/tmp_turtle_kv/

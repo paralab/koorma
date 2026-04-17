@@ -1,0 +1,27 @@
+---
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 2
+AccessModifierOffset: -1
+AllowShortFunctionsOnASingleLine: Inline
+DerivePointerAlignment: false
+PointerAlignment: Left
+AlwaysBreakTemplateDeclarations: Yes
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<koorma/'
+    Priority: 1
+  - Regex: '^".*"'
+    Priority: 2
+  - Regex: '^<absl/'
+    Priority: 3
+  - Regex: '^<liburing'
+    Priority: 3
+  - Regex: '^<spdlog/'
+    Priority: 3
+  - Regex: '^<fmt/'
+    Priority: 3
+  - Regex: '^<[a-z_]+>'
+    Priority: 4
+  - Regex: '.*'
+    Priority: 5
