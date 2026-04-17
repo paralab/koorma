@@ -1,11 +1,16 @@
 #include "engine/manifest.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cctype>
 #include <charconv>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace koorma::engine {
 namespace {
@@ -84,6 +89,12 @@ StatusOr<Manifest> read_manifest(const std::filesystem::path& db_dir) noexcept t
         } else if (kv.key == "page_size") {
           if (!parse_int(kv.value, d.page_size))
             return std::unexpected{Status{ErrorCode::kCorruption}};
+        } else if (kv.key == "page_capacity") {
+          if (!parse_int(kv.value, d.page_capacity))
+            return std::unexpected{Status{ErrorCode::kCorruption}};
+        } else if (kv.key == "next_physical") {
+          if (!parse_int(kv.value, d.next_physical))
+            return std::unexpected{Status{ErrorCode::kCorruption}};
         }
       }
       if (d.page_size == 0 || d.path.empty()) {
@@ -97,6 +108,56 @@ StatusOr<Manifest> read_manifest(const std::filesystem::path& db_dir) noexcept t
   return m;
 } catch (...) {
   return std::unexpected{Status{ErrorCode::kIoError}};
+}
+
+//== write ==========================================================
+
+Status write_manifest(const std::filesystem::path& db_dir, const Manifest& manifest) noexcept {
+  const auto final_path = db_dir / "koorma.manifest";
+  const auto temp_path = db_dir / "koorma.manifest.new";
+
+  // Write to temp file.
+  {
+    std::ofstream out{temp_path, std::ios::binary | std::ios::trunc};
+    if (!out) return Status{ErrorCode::kIoError};
+    out << "# koorma manifest (auto-generated)\n";
+    out << "version=" << manifest.version << "\n";
+    out << "root_page_id=0x" << std::hex << manifest.root_page_id << std::dec << "\n";
+    for (const auto& d : manifest.devices) {
+      out << "device"
+          << " id=" << d.id
+          << " path=" << d.path.string()
+          << " page_size=" << d.page_size
+          << " page_capacity=" << d.page_capacity
+          << " next_physical=" << d.next_physical << "\n";
+    }
+    out.flush();
+    if (!out) return Status{ErrorCode::kIoError};
+  }
+
+  // fsync the temp file's bytes.
+  {
+    const int fd = ::open(temp_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+      ::fsync(fd);
+      ::close(fd);
+    }
+  }
+
+  // Atomic rename.
+  std::error_code ec;
+  std::filesystem::rename(temp_path, final_path, ec);
+  if (ec) return Status{ErrorCode::kIoError};
+
+  // fsync the directory so the rename is durable.
+  {
+    const int dfd = ::open(db_dir.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+    if (dfd >= 0) {
+      ::fsync(dfd);
+      ::close(dfd);
+    }
+  }
+  return Status{};
 }
 
 }  // namespace koorma::engine

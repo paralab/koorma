@@ -9,6 +9,11 @@ Status PageCatalog::register_device(std::uint32_t device_id, std::unique_ptr<Pag
   return inserted ? Status{} : Status{ErrorCode::kAlreadyExists};
 }
 
+PageFile* PageCatalog::page_file(std::uint32_t device_id) noexcept {
+  auto it = devices_.find(device_id);
+  return it == devices_.end() ? nullptr : it->second.get();
+}
+
 StatusOr<std::span<const std::uint8_t>> PageCatalog::page(std::uint64_t page_id) const noexcept {
   const auto dev = format::page_id_device(page_id);
   const auto it = devices_.find(dev);

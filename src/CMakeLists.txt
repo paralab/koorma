@@ -9,10 +9,13 @@ target_sources(koorma_core PRIVATE
   io/crc.cpp
   io/page_file.cpp
   io/page_catalog.cpp
+  mem/memtable.cpp
   tree/leaf_view.cpp
   tree/leaf_builder.cpp
   tree/node_view.cpp
   tree/walker.cpp
   engine/manifest.cpp
+  engine/page_allocator.cpp
+  engine/checkpoint_writer.cpp
   engine/kv_store_impl.cpp
 )

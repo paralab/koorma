@@ -33,6 +33,10 @@ class PageCatalog {
     return devices_.contains(device_id);
   }
 
+  // Mutable access to the underlying PageFile — returns nullptr if
+  // unknown. Used by the checkpoint writer to scribble new pages.
+  PageFile* page_file(std::uint32_t device_id) noexcept;
+
  private:
   absl::flat_hash_map<std::uint32_t, std::unique_ptr<PageFile>> devices_;
 };

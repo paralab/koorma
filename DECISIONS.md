@@ -177,7 +177,29 @@ as Phase 1 lands).
 - **VQF license compatibility.** Confirm vqf's license is compatible with
   our intended license (TBD — inherited from turtle_kv's Apache 2.0?).
 
-## 10. Change log
+## 10. Phase 3 scope notes
 
-- 2026-04-17: Initial document. Locked choices 3.1–3.5. Pinned upstream
-  at `c1d196f1`. Phase 1 kicked off.
+- **WAL deferred.** Turtle_kv's `pack_change_log_slot` is TODO at the pinned
+  commit, and upstream already documents "missing: key recovery after
+  shutdown". Phase 3 matches that: writes live in the memtable only,
+  durability arrives on `force_checkpoint()`. Data written without a
+  checkpoint is lost on crash — *intentionally*, to mirror upstream's
+  current alpha behavior.
+- **Single-leaf checkpoint only.** Phase 3 emits one leaf page per
+  `force_checkpoint()`. If the memtable doesn't fit, returns
+  `kResourceExhausted`. Phase 4 adds multi-leaf + internal nodes.
+- **Single device in bootstrap layout.** Phase 3 uses one page file (device
+  0), size = `TreeOptions::leaf_size`. Phase 4 adds a separate 4 KiB device
+  for internal nodes and wires the full turtle_kv arena shape.
+- **Atomic manifest rewrite.** `koorma.manifest.new` + `rename(2)` + parent
+  `fsync(2)` — crash-safe root-pointer swap.
+- **Bump allocator, no reclamation.** Old tree roots become garbage. Page
+  reclamation (ref-counting, a la LLFS) is Phase 5.
+
+## 11. Change log
+
+- 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
+- 2026-04-17: Phase 2 done — read path validated via leaf roundtrip +
+  end-to-end walker.
+- 2026-04-17: Phase 3 done — write path (create/put/remove/get/
+  force_checkpoint + manifest rewrite). 37 tests passing.
