@@ -1,50 +1,17 @@
 #pragma once
 
-#include "format/endian.hpp"
-#include "format/page_layout.hpp"
-
-#include <cstdint>
-
-// KV store root / superblock. Identifies the durable config and the most
-// recent committed checkpoint. Written to a fixed file in the database
-// directory (name TBD — turtle_kv uses llfs::StorageContext conventions).
+// Database-directory structure. turtle_kv uses llfs::StorageContext, which
+// represents the database as a *directory* containing multiple LLFS log /
+// page files, not a single superblock file.
 //
-// TODO(phase-2): determine exact filename + layout from turtle_kv's
-// KVStore::create path.
+// For Phase 2, we only need to know enough to locate the checkpoint log
+// and then the tree root. The full Volume / StorageContext layout is
+// Phase 3 scope.
+//
+// TODO(phase-3): document the directory layout (filenames, expected
+// contents) once we implement KVStore::create(). Files observed from
+// turtle_kv test harness will be listed here.
 
 namespace koorma::format {
-
-constexpr std::uint32_t kKoormaSuperblockMagic = 0x4B56414B;  // "KVAK" placeholder
-
-struct PackedSuperblock {
-  little_u32 magic;             // kKoormaSuperblockMagic (TODO: match LLFS)
-  little_u32 format_version;
-  little_u64 creation_time_us;
-
-  // durable config
-  little_u32 node_size_log2;
-  little_u32 leaf_size_log2;
-  little_u32 filter_page_size_log2;
-  little_u32 filter_bits_per_key;
-  little_u32 max_levels;
-  little_u32 buffer_level_trim;
-  little_u32 key_size_hint;
-  little_u32 value_size_hint;
-  little_u64 initial_capacity_bytes;
-  little_u64 max_capacity_bytes;
-  little_u64 change_log_size_bytes;
-
-  // checkpoint pointer
-  PageId latest_checkpoint_page_id;
-  little_u64 latest_checkpoint_epoch;
-
-  // trailer
-  little_u32 crc32c;
-  little_u32 reserved;
-};
-
-static_assert(sizeof(PackedSuperblock) == 96,
-              "placeholder — re-check against turtle_kv StorageContext "
-              "superblock layout");
-
-}  // namespace koorma::format
+// intentionally empty — placeholder header
+}

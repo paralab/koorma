@@ -28,7 +28,6 @@ class KoormaRecipe(ConanFile):
     def requirements(self):
         self.requires("abseil/20250127.0")
         self.requires("liburing/[>=2.11 <3]")
-        self.requires("crc32c/1.1.2")
         self.requires("spdlog/[>=1.14 <2]")
         self.requires("fmt/[>=10 <12]", override=True)
 

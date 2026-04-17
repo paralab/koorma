@@ -93,7 +93,7 @@ Pinned upstream: `mathworks/turtle_kv @ c1d196f1d842acaa0f9ed2d52c551f9af82379e1
 | Status / StatusOr | STDLIB | `std::expected<T, std::error_code>` |
 | Logging | LIB | `spdlog` (replaces glog) |
 | Metrics | STDLIB | tiny inline atomics |
-| CRC32C | LIB | Google `crc32c` (hardware-accelerated) |
+| CRC32C | LIB | `absl::crc32c::Crc32c` (hardware-accelerated) — one less dep |
 | Byte packing / endian | STDLIB | `std::byteswap`, `std::endian`, `<bit>` |
 | Task scheduling | STDLIB | `std::jthread`, `std::latch`, `std::stop_token` |
 | Smart pointers | STDLIB | `std::shared_ptr`, `std::unique_ptr` |
@@ -121,10 +121,9 @@ Minimal set, all via Conan:
 
 | Dep | Version | Purpose |
 |---|---|---|
-| `abseil` | 20250127.0+ | btree_map, flat_hash_map, Mutex, string utils, BloomFilter |
+| `abseil` | 20250127.0+ | btree_map, flat_hash_map, Mutex, string utils, BloomFilter, crc32c |
 | `liburing` | >=2.11 | async I/O |
 | `vqf` | >=0.2.5 | quotient filter |
-| `crc32c` | latest | hardware CRC32C |
 | `spdlog` | >=1.14 | logging (pulls `fmt`) |
 | `gtest` | >=1.16 | tests only |
 

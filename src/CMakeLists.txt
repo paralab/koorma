@@ -6,5 +6,13 @@
 
 target_sources(koorma_core PRIVATE
   api.cpp
-  # Phase 1 — format/, io/, engine/ stubs added as they land.
+  io/crc.cpp
+  io/page_file.cpp
+  io/page_catalog.cpp
+  tree/leaf_view.cpp
+  tree/leaf_builder.cpp
+  tree/node_view.cpp
+  tree/walker.cpp
+  engine/manifest.cpp
+  engine/kv_store_impl.cpp
 )

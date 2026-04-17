@@ -1,54 +1,68 @@
 #pragma once
 
 #include "format/endian.hpp"
-#include "format/page_layout.hpp"
+#include "format/packed_page_id.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
-// Filter page layouts. Two kinds:
-//   - Bloom:  llfs::PackedBloomFilterPage
-//   - VQF:    turtle_kv::PackedVqfFilter (from vqf_filter_page_view.hpp)
+// Filter page layouts. Two flavors; koorma supports reading either.
 //
-// A build selects one at compile time via KOORMA_USE_BLOOM_FILTER /
-// KOORMA_USE_QUOTIENT_FILTER. To read turtle_kv files of either kind, the
-// page header's `kind` field identifies which layout follows.
+// Bloom filter: LLFS PackedBloomFilterPage (40-byte header + variable
+// PackedBloomFilter header + variable word array).
+// Mirrors llfs/packed_bloom_filter_page.hpp.
 //
-// TODO(phase-2): reverse from:
-//   - llfs/packed_bloom_filter_page.hpp
-//   - src/turtle_kv/vqf_filter_page_view.hpp
+// VQF filter: turtle_kv PackedVqfFilter (32-byte header + vqf metadata).
+// Mirrors turtle_kv/vqf_filter_page_view.hpp.
 
 namespace koorma::format {
 
-enum class FilterKind : std::uint16_t {
-  kNone = 0,
-  kBloom = 1,
-  kVqf8 = 2,
-  kVqf16 = 3,
+//---- Bloom ---------------------------------------------------------------
+
+struct PackedBloomFilter {
+  little_u64 word_count_;                // number of 64-bit words in filter
+  little_u64 block_count_;                // 1 = flat, >1 = blocked
+  little_u16 hash_count_;                 // number of hash functions
+  std::uint8_t layout_;                   // BloomFilterLayout enum
+  std::uint8_t word_count_pre_mul_shift_;
+  std::uint8_t word_count_post_mul_shift_;
+  std::uint8_t block_count_pre_mul_shift_;
+  std::uint8_t block_count_post_mul_shift_;
+  std::uint8_t reserved_[41];             // pad to 64 bytes so words[] is aligned
+  // followed by little_u64 words[word_count_]
+};
+static_assert(sizeof(PackedBloomFilter) == 64);
+
+enum class BloomFilterLayout : std::uint8_t {
+  kFlat = 0,
+  kBlocked64 = 1,
+  kBlocked512 = 2,
 };
 
-struct PackedBloomFilterHeader {
-  little_u16 kind;            // FilterKind::kBloom
-  little_u16 hash_count;
-  little_u32 bit_count;
-  little_u32 bits_per_key;
-  little_u32 item_count;
-  // followed by bit_count bits of filter data
+struct PackedBloomFilterPage {
+  static constexpr std::uint64_t kMagic = 0xca6f49a0f3f8a4b0ULL;
+
+  little_u64 xxh3_checksum;               // [0..8)
+  little_u64 magic;                       // [8..16)
+  little_u64 bit_count;                   // [16..24)   optional count of set bits
+  PackedPageId src_page_id;               // [24..32)   associated data page
+  PackedBloomFilter bloom_filter;         // [32..96)   then words[] tail
 };
+static_assert(sizeof(PackedBloomFilterPage) == 96);
+static_assert(offsetof(PackedBloomFilterPage, magic) == 8);
 
-static_assert(sizeof(PackedBloomFilterHeader) == 16,
-              "placeholder — re-check vs llfs packed_bloom_filter_page.hpp");
+//---- VQF -----------------------------------------------------------------
 
-struct PackedVqfFilterHeader {
-  little_u16 kind;            // FilterKind::kVqf8 or kVqf16
-  little_u16 reserved;
-  little_u32 slot_count;
-  little_u32 bits_per_key;
-  little_u32 item_count;
-  little_u64 quotient_mask;
-  // followed by slot array (8-bit or 16-bit entries)
+struct PackedVqfFilter {
+  static constexpr std::uint64_t kMagic = 0x16015305e0f43a7dULL;
+  static constexpr std::uint64_t kHashSeed = 0x9d0924dc03e79a75ULL;
+
+  little_u64 magic;                       // [0..8)
+  PackedPageId src_page_id;               // [8..16)
+  little_u64 hash_seed;                   // [16..24)
+  little_u64 hash_mask;                   // [24..32)
+  // followed by vqf_metadata (variable)
 };
-
-static_assert(sizeof(PackedVqfFilterHeader) == 24,
-              "placeholder — re-check vs turtle_kv vqf_filter_page_view.hpp");
+static_assert(sizeof(PackedVqfFilter) == 32);
 
 }  // namespace koorma::format

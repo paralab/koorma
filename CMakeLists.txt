@@ -23,7 +23,6 @@ endif()
 
 find_package(absl REQUIRED)
 find_package(liburing REQUIRED)
-find_package(Crc32c REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(fmt REQUIRED)
 # vqf is vendored or found via Conan; wired in src/mem/CMakeLists.txt
@@ -33,11 +32,11 @@ target_include_directories(koorma_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 target_link_libraries(koorma_core PUBLIC
-  absl::base absl::btree absl::flat_hash_map absl::hash
+  absl::base absl::btree absl::crc32c absl::flat_hash_map absl::hash
   absl::strings absl::synchronization absl::status absl::statusor
   spdlog::spdlog fmt::fmt)
 target_link_libraries(koorma_core PRIVATE
-  liburing::liburing Crc32c::crc32c)
+  liburing::liburing)
 
 if(KOORMA_USE_BLOOM_FILTER)
   target_compile_definitions(koorma_core PUBLIC KOORMA_USE_BLOOM_FILTER=1)
