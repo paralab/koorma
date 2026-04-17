@@ -66,40 +66,66 @@ StatusOr<ValueView> get(const io::PageCatalog& catalog, std::uint64_t root_page_
   return std::unexpected{Status{ErrorCode::kCorruption}};
 }
 
-Status scan_tree(const io::PageCatalog& catalog, std::uint64_t root_page_id,
-                 const KeyView& min_key, const ScanCallback& cb) noexcept {
-  auto bytes_or = catalog.page(root_page_id);
-  if (!bytes_or.has_value()) return bytes_or.error();
-  const auto root_bytes = *bytes_or;
-  if (root_bytes.size() < sizeof(format::PackedPageHeader)) return Status{ErrorCode::kCorruption};
+namespace {
 
-  const auto& hdr = *reinterpret_cast<const format::PackedPageHeader*>(root_bytes.data());
+// Recursive subtree scan. `is_leftmost` is true for the first subtree
+// in the current walk (i.e., the one that must honor min_key); all later
+// subtrees in-order have already passed min_key and iterate from their
+// own min key. Returns `false` iff the callback halted iteration.
+bool scan_subtree(const io::PageCatalog& catalog, std::uint64_t page_id,
+                  const KeyView& min_key, bool is_leftmost, const ScanCallback& cb,
+                  Status* status) noexcept {
+  auto bytes_or = catalog.page(page_id);
+  if (!bytes_or.has_value()) {
+    *status = bytes_or.error();
+    return false;
+  }
+  const auto bytes = *bytes_or;
+  if (bytes.size() < sizeof(format::PackedPageHeader)) {
+    *status = Status{ErrorCode::kCorruption};
+    return false;
+  }
+  const auto& hdr = *reinterpret_cast<const format::PackedPageHeader*>(bytes.data());
 
   if (hdr.layout_id == format::kLeafPageLayoutId) {
-    auto lv_or = LeafView::parse(root_bytes);
-    if (!lv_or.has_value()) return lv_or.error();
-    iterate_leaf(*lv_or, min_key, cb);
-    return Status{};
+    auto lv_or = LeafView::parse(bytes);
+    if (!lv_or.has_value()) {
+      *status = lv_or.error();
+      return false;
+    }
+    return iterate_leaf(*lv_or, is_leftmost ? min_key : KeyView{""}, cb);
   }
 
   if (hdr.layout_id == format::kNodePageLayoutId) {
-    auto nv_or = NodeView::parse(root_bytes);
-    if (!nv_or.has_value()) return nv_or.error();
-    if (nv_or->height() > 1) return Status{ErrorCode::kUnimplemented};  // Phase 5+
-
-    const std::size_t start = nv_or->route(min_key);
-    for (std::size_t i = start; i < nv_or->pivot_count(); ++i) {
-      auto child_bytes_or = catalog.page(nv_or->child_page_id(i));
-      if (!child_bytes_or.has_value()) return child_bytes_or.error();
-      auto child_lv_or = LeafView::parse(*child_bytes_or);
-      if (!child_lv_or.has_value()) return child_lv_or.error();
-      const KeyView effective_min = (i == start) ? min_key : KeyView{};
-      if (!iterate_leaf(*child_lv_or, effective_min, cb)) return Status{};
+    auto nv_or = NodeView::parse(bytes);
+    if (!nv_or.has_value()) {
+      *status = nv_or.error();
+      return false;
     }
-    return Status{};
+    // On the leftmost walk, start at the child that covers min_key; on
+    // subsequent subtrees, start at child 0.
+    const std::size_t start = is_leftmost ? nv_or->route(min_key) : 0;
+    for (std::size_t i = start; i < nv_or->pivot_count(); ++i) {
+      const bool child_leftmost = is_leftmost && (i == start);
+      if (!scan_subtree(catalog, nv_or->child_page_id(i), min_key, child_leftmost, cb,
+                        status)) {
+        return false;
+      }
+    }
+    return true;
   }
 
-  return Status{ErrorCode::kCorruption};
+  *status = Status{ErrorCode::kCorruption};
+  return false;
+}
+
+}  // namespace
+
+Status scan_tree(const io::PageCatalog& catalog, std::uint64_t root_page_id,
+                 const KeyView& min_key, const ScanCallback& cb) noexcept {
+  Status status{};
+  scan_subtree(catalog, root_page_id, min_key, /*is_leftmost=*/true, cb, &status);
+  return status;
 }
 
 }  // namespace koorma::tree

@@ -7,11 +7,10 @@
 
 #include <koorma/kv_store.hpp>
 
-#include <absl/synchronization/mutex.h>
-
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <shared_mutex>
 #include <system_error>
 #include <utility>
 
@@ -40,7 +39,8 @@ struct KVStore::Impl {
   // Guards: manifest, root_page_id, allocator, page catalog mutations.
   // Per-shard memtable mutexes are independent and do NOT need engine_mutex.
   // Lock order: engine_mutex (exclusive) → all shard mutexes (ascending id).
-  absl::Mutex engine_mutex;
+  // std::shared_mutex so reads (get via tree walker) can overlap.
+  std::shared_mutex engine_mutex;
 };
 
 KVStore::KVStore(std::unique_ptr<Impl> impl) noexcept : impl_{std::move(impl)} {}
@@ -142,7 +142,7 @@ StatusOr<ValueView> KVStore::get(const KeyView& key) {
   // Fall through to the tree. ValueViews returned from the walker point
   // into mmap'd page memory, which stays mapped for the life of the
   // store — stable without any local copy.
-  absl::ReaderMutexLock lock{&impl_->engine_mutex};
+  std::shared_lock lock{impl_->engine_mutex};
   if (impl_->manifest.root_page_id == engine::kEmptyTreeRoot) {
     return std::unexpected{Status{ErrorCode::kNotFound}};
   }
@@ -203,7 +203,7 @@ StatusOr<std::size_t> KVStore::scan(const KeyView& min_key,
   tree_items.reserve(items_out.size());
 
   {
-    absl::ReaderMutexLock lock{&impl_->engine_mutex};
+    std::shared_lock lock{impl_->engine_mutex};
     if (impl_->manifest.root_page_id != engine::kEmptyTreeRoot) {
       std::size_t collected = 0;
       auto st = tree::scan_tree(
@@ -280,7 +280,7 @@ StatusOr<std::size_t> KVStore::scan_keys(const KeyView& min_key,
 }
 
 Status KVStore::force_checkpoint() {
-  absl::MutexLock lock{&impl_->engine_mutex};
+  std::unique_lock lock{impl_->engine_mutex};
   if (impl_->memtable.empty()) return OkStatus();
 
   auto* leaf_file = impl_->catalog.page_file(kPhase3LeafDevice);

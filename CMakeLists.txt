@@ -14,6 +14,7 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion
                     -Wno-unused-parameter -fno-omit-frame-pointer)
 
 option(KOORMA_BUILD_TESTS "Build gtest suites" ON)
+option(KOORMA_BUILD_BENCH "Build bench harness" ON)
 option(KOORMA_USE_BLOOM_FILTER "Use Bloom filters (default)" ON)
 option(KOORMA_USE_QUOTIENT_FILTER "Use VQF quotient filters" OFF)
 
@@ -51,4 +52,8 @@ if(KOORMA_BUILD_TESTS)
   enable_testing()
   find_package(GTest REQUIRED)
   add_subdirectory(test)
+endif()
+
+if(KOORMA_BUILD_BENCH)
+  add_subdirectory(bench)
 endif()

@@ -224,7 +224,35 @@ as Phase 1 lands).
     generation). No data loss.
   - No `ThreadSanitizer` run yet — add in Phase 5.
 
-## 12. Change log
+## 12. Phase 5 scope notes
+
+- **Tree height now unbounded** (up to `kMaxLevels = 6`, matching turtle_kv).
+  `flush_memtable_to_checkpoint` builds levels iteratively: leaves → level-1
+  nodes → level-2 nodes → … until one root. `scan_tree` is recursive.
+  Verified with a 60 k-key 2-level tree (`deep_tree_test`).
+- **Mutex switch**: dropped `absl::Mutex` in favor of `std::mutex` /
+  `std::shared_mutex`. Reason: system-installed libabsl isn't built with
+  TSAN annotations, so TSAN couldn't see absl mutex synchronization and
+  reported the btree accesses as racy. `std::mutex` uses `pthread_mutex`
+  which TSAN intercepts natively. No functional change; if we ever link
+  against a TSAN-built abseil, the choice can be revisited.
+- **TSAN verification**: ran 89 concurrent-path tests (5 test binaries,
+  concurrency/memtable/checkpoint/put_get/deep_tree) under
+  `-fsanitize=thread` — **0 races**. Phase 4 concurrency claims verified.
+- **Bench baseline** (Manjaro, Ryzen 7, single thread, 16 KiB leaves):
+  - n=10k:  ~9 Mops/s put memtable, ~6 Mops/s get random, ~38 Mrow/s scan.
+  - n=100k: ~8 Mops/s put memtable, ~4.5 Mops/s get random, ~42 Mrow/s scan.
+  - `force_checkpoint` at 100k takes ~18 ms (single thread, mmap write).
+  - Not tuned — expect 2–5× once we add a read-side bloom filter + page
+    reclamation + multi-thread writers.
+- **Still deferred to future phases**:
+  - Bloom / VQF filter integration (needs parent-node segment filters).
+  - LLFS `Volume` layout for opening real turtle_kv databases.
+  - WAL (matches upstream TODO).
+  - Page reclamation / ref-counting.
+  - Separate 4 KiB node arena vs. 2 MiB leaf arena.
+
+## 13. Change log
 
 - 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
 - 2026-04-17: Phase 2 done — read path validated via leaf roundtrip +
@@ -233,3 +261,5 @@ as Phase 1 lands).
   force_checkpoint + manifest rewrite). 37 tests passing.
 - 2026-04-17: Phase 4 done — sharded memtable, multi-leaf checkpoint
   with internal node, scan, concurrent put/get. 49 tests passing.
+- 2026-04-17: Phase 5 done — multi-level trees, TSAN clean, bench
+  harness + baseline numbers. 50 tests passing + 0 TSAN races.

@@ -19,12 +19,10 @@ template <typename ShardVec>
 class AllShardsLock {
  public:
   explicit AllShardsLock(ShardVec& shards) noexcept : shards_{shards} {
-    for (auto& sh : shards_) sh->mu.Lock();
+    for (auto& sh : shards_) sh->mu.lock();
   }
   ~AllShardsLock() noexcept {
-    // Unlock in reverse order — symmetric with lock, also keeps any
-    // ordered-acquire guarantee intact.
-    for (auto it = shards_.rbegin(); it != shards_.rend(); ++it) (*it)->mu.Unlock();
+    for (auto it = shards_.rbegin(); it != shards_.rend(); ++it) (*it)->mu.unlock();
   }
   AllShardsLock(const AllShardsLock&) = delete;
   AllShardsLock& operator=(const AllShardsLock&) = delete;
@@ -50,7 +48,7 @@ std::size_t Memtable::shard_index(const KeyView& key) const noexcept {
 
 void Memtable::put(const KeyView& key, const ValueView& value) {
   auto& shard = *shards_[shard_index(key)];
-  absl::MutexLock lock{&shard.mu};
+  std::lock_guard lock{shard.mu};
   auto& slot = shard.map[std::string(key)];
   slot.op = value.op();
   slot.body.assign(value.as_str());
@@ -58,7 +56,7 @@ void Memtable::put(const KeyView& key, const ValueView& value) {
 
 void Memtable::remove(const KeyView& key) {
   auto& shard = *shards_[shard_index(key)];
-  absl::MutexLock lock{&shard.mu};
+  std::lock_guard lock{shard.mu};
   auto& slot = shard.map[std::string(key)];
   slot.op = ValueView::OP_DELETE;
   slot.body.clear();
@@ -66,7 +64,7 @@ void Memtable::remove(const KeyView& key) {
 
 StatusOr<Memtable::GetResult> Memtable::get(const KeyView& key) const {
   auto& shard = *shards_[shard_index(key)];
-  absl::MutexLock lock{&shard.mu};
+  std::lock_guard lock{shard.mu};
   const auto it = shard.map.find(std::string(key));
   if (it == shard.map.end()) return std::unexpected{Status{ErrorCode::kNotFound}};
   return GetResult{it->second.op, it->second.body};
@@ -74,7 +72,7 @@ StatusOr<Memtable::GetResult> Memtable::get(const KeyView& key) const {
 
 bool Memtable::empty() const noexcept {
   for (const auto& sh : shards_) {
-    absl::MutexLock lock{&sh->mu};
+    std::lock_guard lock{sh->mu};
     if (!sh->map.empty()) return false;
   }
   return true;
@@ -83,7 +81,7 @@ bool Memtable::empty() const noexcept {
 std::size_t Memtable::size() const noexcept {
   std::size_t total = 0;
   for (const auto& sh : shards_) {
-    absl::MutexLock lock{&sh->mu};
+    std::lock_guard lock{sh->mu};
     total += sh->map.size();
   }
   return total;

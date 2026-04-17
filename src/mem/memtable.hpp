@@ -5,11 +5,11 @@
 #include <koorma/value_view.hpp>
 
 #include <absl/container/btree_map.h>
-#include <absl/synchronization/mutex.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,8 +61,12 @@ class Memtable {
 
  private:
   struct Shard {
-    mutable absl::Mutex mu;
-    absl::btree_map<std::string, Slot> map ABSL_GUARDED_BY(mu);
+    // std::mutex is what TSAN can instrument (absl::Mutex requires a
+    // TSAN-built abseil, which the system package typically isn't).
+    // The mutex only guards in-shard ops; snapshot ops take every
+    // shard mutex in ascending id order to avoid deadlock.
+    mutable std::mutex mu;
+    absl::btree_map<std::string, Slot> map;
   };
 
   std::size_t shard_index(const KeyView& key) const noexcept;
