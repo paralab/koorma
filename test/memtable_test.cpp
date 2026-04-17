@@ -3,9 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
-#include <vector>
 
-using koorma::KeyView;
 using koorma::ValueView;
 using koorma::mem::Memtable;
 
@@ -14,8 +12,8 @@ TEST(Memtable, PutAndGet) {
   mt.put("foo", ValueView::from_str("bar"));
   auto v = mt.get("foo");
   ASSERT_TRUE(v.has_value());
-  EXPECT_EQ(v->as_str(), "bar");
-  EXPECT_EQ(v->op(), ValueView::OP_WRITE);
+  EXPECT_EQ(v->body, "bar");
+  EXPECT_EQ(v->op, ValueView::OP_WRITE);
 }
 
 TEST(Memtable, OverwriteKeepsLatestValue) {
@@ -24,7 +22,7 @@ TEST(Memtable, OverwriteKeepsLatestValue) {
   mt.put("k", ValueView::from_str("second"));
   auto v = mt.get("k");
   ASSERT_TRUE(v.has_value());
-  EXPECT_EQ(v->as_str(), "second");
+  EXPECT_EQ(v->body, "second");
 }
 
 TEST(Memtable, RemoveStoresDeleteTombstone) {
@@ -33,7 +31,7 @@ TEST(Memtable, RemoveStoresDeleteTombstone) {
   mt.remove("x");
   auto v = mt.get("x");
   ASSERT_TRUE(v.has_value()) << "deleted key should still be present as tombstone";
-  EXPECT_TRUE(v->is_delete());
+  EXPECT_EQ(v->op, ValueView::OP_DELETE);
 }
 
 TEST(Memtable, MissingKeyReturnsNotFound) {
@@ -43,18 +41,16 @@ TEST(Memtable, MissingKeyReturnsNotFound) {
   EXPECT_EQ(v.error().code(), koorma::make_error_code(koorma::ErrorCode::kNotFound));
 }
 
-TEST(Memtable, IteratesInSortedOrder) {
+TEST(Memtable, MergedSnapshotSorted) {
   Memtable mt;
   mt.put("zeta", ValueView::from_str("z"));
   mt.put("alpha", ValueView::from_str("a"));
   mt.put("mu", ValueView::from_str("m"));
-
-  std::vector<std::string> keys;
-  for (auto it = mt.begin(); it != mt.end(); ++it) keys.push_back(it->first);
-  ASSERT_EQ(keys.size(), 3u);
-  EXPECT_EQ(keys[0], "alpha");
-  EXPECT_EQ(keys[1], "mu");
-  EXPECT_EQ(keys[2], "zeta");
+  auto snap = mt.merged_snapshot();
+  ASSERT_EQ(snap.size(), 3u);
+  EXPECT_EQ(snap[0].first, "alpha");
+  EXPECT_EQ(snap[1].first, "mu");
+  EXPECT_EQ(snap[2].first, "zeta");
 }
 
 TEST(Memtable, ClearEmptiesStorage) {

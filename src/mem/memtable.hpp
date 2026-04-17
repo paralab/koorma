@@ -5,18 +5,26 @@
 #include <koorma/value_view.hpp>
 
 #include <absl/container/btree_map.h>
+#include <absl/synchronization/mutex.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace koorma::mem {
 
-// In-memory sorted map of pending writes. Single-shard for Phase 3 — the
-// `KVStore::Impl` guards it with a mutex. Phase 4 will shard on key hash.
+// Sharded in-memory map of pending writes. Keys are routed to shards by
+// absl::Hash<std::string>; each shard owns its own btree_map + mutex. Non-
+// overlapping writers don't contend.
 //
-// Keys and value bodies are owned std::strings (copied from incoming
-// KeyView/ValueView on put). The returned ValueView from get() borrows
-// into memtable storage; its lifetime is tied to this Memtable instance.
+// Snapshot operations (for checkpoint flush and scan) acquire every
+// shard lock in ascending shard-id order — deadlock-free by convention
+// as long as no other code takes shard locks in a different order. The
+// Memtable itself takes no "outer" lock; the owning KVStore provides one
+// for operations that need stronger serialization (force_checkpoint).
 class Memtable {
  public:
   struct Slot {
@@ -24,29 +32,44 @@ class Memtable {
     std::string body;
   };
 
+  explicit Memtable(std::size_t shard_count = 16);
+
   void put(const KeyView& key, const ValueView& value);
   void remove(const KeyView& key);
 
-  // Returns the stored ValueView for `key`. OP_DELETE is treated as a
-  // present tombstone; callers decide how to interpret it.
-  StatusOr<ValueView> get(const KeyView& key) const noexcept;
+  // Returns (OpCode, copy of body) for the key, or NotFound.
+  struct GetResult {
+    ValueView::OpCode op;
+    std::string body;
+  };
+  StatusOr<GetResult> get(const KeyView& key) const;
 
-  std::size_t size() const noexcept { return slots_.size(); }
-  bool empty() const noexcept { return slots_.empty(); }
+  bool empty() const noexcept;
+  std::size_t size() const noexcept;
+  void clear() noexcept;
 
-  void clear() noexcept { slots_.clear(); }
+  // Take all shard locks in order and produce a sorted merged snapshot
+  // of every (key, slot) pair. Used by force_checkpoint.
+  std::vector<std::pair<std::string, Slot>> merged_snapshot() const;
 
-  // Iteration (sorted by key). For checkpoint flush.
-  using Iter = absl::btree_map<std::string, Slot>::const_iterator;
-  Iter begin() const noexcept { return slots_.begin(); }
-  Iter end() const noexcept { return slots_.end(); }
+  // Same, but only items with `key >= min_key`, capped at `max_count`.
+  // Used by scan.
+  std::vector<std::pair<std::string, Slot>> range_snapshot(const KeyView& min_key,
+                                                           std::size_t max_count) const;
+
+  std::size_t shard_count() const noexcept { return shards_.size(); }
 
  private:
-  absl::btree_map<std::string, Slot> slots_;
-};
+  struct Shard {
+    mutable absl::Mutex mu;
+    absl::btree_map<std::string, Slot> map ABSL_GUARDED_BY(mu);
+  };
 
-// Construct a ValueView borrowing body bytes from `slot`. The view is
-// valid for as long as `slot` is not mutated or destroyed.
-ValueView slot_to_value_view(const Memtable::Slot& slot) noexcept;
+  std::size_t shard_index(const KeyView& key) const noexcept;
+
+  // One heap allocation per shard — each Shard contains a Mutex, which
+  // is neither movable nor copyable, so the vector must hold pointers.
+  std::vector<std::unique_ptr<Shard>> shards_;
+};
 
 }  // namespace koorma::mem

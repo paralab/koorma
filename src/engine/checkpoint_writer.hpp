@@ -10,19 +10,22 @@
 
 namespace koorma::engine {
 
-// Phase 3 checkpoint: serialize a memtable snapshot into a single leaf
-// page on the given leaf device. Returns the new root_page_id.
+// Flush a memtable snapshot into on-disk pages. Builds one or more leaf
+// pages; if more than one leaf is produced, also emits a single internal
+// node above them. Returns the new root page id (either the leaf itself,
+// for single-leaf trees, or the internal node).
 //
-// Scope limit: single leaf page only. If the memtable doesn't fit,
-// returns kResourceExhausted. Phase 4 will split across multiple leaves
-// and build an internal node above them.
+// `leaf_size` is the page size of the leaf device; the checkpoint writer
+// packs items until a leaf fills, then starts a new one.
 //
-// After returning, `leaf_file` has been written + msync'd. Caller must
-// still rewrite the manifest with the new root_page_id.
-StatusOr<std::uint64_t> flush_memtable_to_single_leaf(
+// Scope limit: tree height ≤ 1. Turtle_kv supports up to kMaxLevels = 6,
+// but for Phase 4 a single-level tree covers up to ~64 leaves. Beyond
+// that this returns kResourceExhausted.
+StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
     const mem::Memtable& memtable,
     PageAllocator& allocator,
     std::uint32_t leaf_device_id,
-    io::PageFile& leaf_file) noexcept;
+    io::PageFile& leaf_file,
+    std::uint32_t leaf_size) noexcept;
 
 }  // namespace koorma::engine

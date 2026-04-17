@@ -13,6 +13,7 @@ target_sources(koorma_core PRIVATE
   tree/leaf_view.cpp
   tree/leaf_builder.cpp
   tree/node_view.cpp
+  tree/node_builder.cpp
   tree/walker.cpp
   engine/manifest.cpp
   engine/page_allocator.cpp

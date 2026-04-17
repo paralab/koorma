@@ -196,10 +196,40 @@ as Phase 1 lands).
 - **Bump allocator, no reclamation.** Old tree roots become garbage. Page
   reclamation (ref-counting, a la LLFS) is Phase 5.
 
-## 11. Change log
+## 11. Phase 4 scope notes
+
+- **Memtable sharded with 16 shards** (hash-routed). Per-shard `absl::Mutex`;
+  no outer lock for put/get/remove. Snapshot ops (checkpoint, scan) take
+  all shard locks in ascending id order — deadlock-free by convention.
+- **Scan lifetime**: returned `KeyView`/`ValueView` point into a thread-
+  local scratch buffer. Valid until the next `scan()` call on the same
+  thread. Documented in API header.
+- **get() lifetime**: memtable hits copy into a thread_local `std::string`,
+  tree hits view directly into the mmap'd page (stable for store lifetime).
+  Memtable-hit views are valid until the next `get()` on the same thread.
+- **Multi-leaf checkpoint + 1-level tree**. Memtables that span multiple
+  leaves get a single internal node above them. Tree height is capped at 1
+  for Phase 4 — up to ~64 leaves. Deeper trees = Phase 5.
+- **Single page file arena still**. Internal nodes currently share the
+  leaf-sized page file (2 MiB slots at turtle_kv default, wasteful for
+  4 KiB-worth node data). A separate 4 KiB node device arrives in Phase 5
+  with the LLFS Volume layout.
+- **Concurrency correctness limits.** Phase 4 guarantees:
+  - Concurrent `put`/`remove` on different keys don't contend.
+  - Concurrent `get` doesn't contend with writes on a different shard.
+  - `scan` takes every shard lock briefly (consistent snapshot).
+  - `force_checkpoint` is serialized by `engine_mutex`; concurrent puts
+    during a checkpoint may or may not be visible depending on timing
+    (they land in the memtable post-snapshot and survive as a new memtable
+    generation). No data loss.
+  - No `ThreadSanitizer` run yet — add in Phase 5.
+
+## 12. Change log
 
 - 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
 - 2026-04-17: Phase 2 done — read path validated via leaf roundtrip +
   end-to-end walker.
 - 2026-04-17: Phase 3 done — write path (create/put/remove/get/
   force_checkpoint + manifest rewrite). 37 tests passing.
+- 2026-04-17: Phase 4 done — sharded memtable, multi-leaf checkpoint
+  with internal node, scan, concurrent put/get. 49 tests passing.
