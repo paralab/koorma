@@ -8,7 +8,7 @@ Design rationale and all architectural choices live in
 [**DECISIONS.md**](./DECISIONS.md). On-disk byte layouts live in
 [**FORMAT.md**](./FORMAT.md). This README tracks *status*.
 
-## Status (as of Phase 6)
+## Status (as of Phase 7)
 
 | # | Phase | Status | Highlights |
 |---|---|---|---|
@@ -18,16 +18,19 @@ Design rationale and all architectural choices live in
 | 4 | Concurrency + scan | ✅ done | 16-shard memtable, multi-leaf checkpoint + internal node, `KVStore::scan` |
 | 5 | Multi-level trees + TSAN + bench | ✅ done | Height up to 6 (≈6.8 × 10¹⁰ leaves), **0 TSAN races across 89 concurrent-path tests**, bench baseline captured |
 | 6 | Bloom filters + walker integration | ✅ done | Per-leaf `PackedBloomFilterPage`, parent node stores filter IDs in `segment_filters`, walker short-circuits on filter miss — **+20–26 % on missing-key `get()`** |
+| 7 | Persistent multi-checkpoint + reclamation | ✅ done | Fixed silent data loss across checkpoints (merge old tree + memtable), per-device free list in the manifest, `allocate()` prefers freed slots; `next_physical` now plateaus over many checkpoints |
 
-**Totals**: 5,384 LoC across 70 files · 59 gtest cases · 0 data races under `-fsanitize=thread` (Phase 5 verification; Phase 6 filter code is guarded by the existing `engine_mutex`, unchanged concurrency surface).
+**Totals**: 5,972 LoC across 72 files · 64 gtest cases · 0 data races under `-fsanitize=thread` (Phase 5 verification; subsequent changes are guarded by the existing `engine_mutex`, unchanged concurrency surface).
 
 ## What works right now
 
 - `KVStore::create(dir, config, RemoveExisting)` / `open(dir, tree_options)`
 - `put(key, value)` / `get(key)` / `remove(key)` / `scan(min_key, items_out)`
-- `force_checkpoint()` — flushes memtable to disk as one or more leaf pages
-  (with internal nodes above them for multi-leaf trees, plus a companion
-  Bloom filter page per leaf when filters are enabled)
+- `force_checkpoint()` — merges the memtable with the existing tree (if any)
+  and flushes the combined state to disk as one or more leaf pages (with
+  internal nodes above them, plus a companion Bloom filter page per leaf
+  when filters are enabled). Old pages are released back to a per-device
+  free list that survives a reopen.
 - Concurrent `put`/`get`/`remove` from many threads (sharded memtable)
 - **Bloom filters on the read path** — `get()` on a missing key short-
   circuits at the parent node without touching the leaf. Runtime-toggleable
@@ -42,11 +45,16 @@ Design rationale and all architectural choices live in
 
 ## What's deferred
 
-(See [DECISIONS.md §14](./DECISIONS.md#14-phase-6-scope-notes) for full rationale.)
+(See [DECISIONS.md §15](./DECISIONS.md#15-phase-7-scope-notes) for full rationale.)
 
 - **LLFS `Volume` directory layout** — koorma currently reads/writes its own
   `koorma.manifest` bootstrap format. Opening databases written by real
   turtle_kv requires reverse-engineering LLFS's slotted-log + volume root.
+- **Incremental update buffers** — koorma's checkpoint rebuilds the whole
+  tree by merging the old root with the memtable (O(DB size) per
+  checkpoint). Turtle_kv's actual design batches edits into internal-node
+  update buffers and flushes them down level-by-level; wiring that in
+  would move us from O(DB) to O(memtable) per checkpoint.
 - **xxh3-compatible filter contents** — koorma writes the LLFS bloom-filter
   *frame* format, but the bit positions are computed from `absl::Hash`
   rather than xxh3. Real turtle_kv filter pages would need xxh3 to probe.
@@ -57,10 +65,11 @@ Design rationale and all architectural choices live in
   our pinned commit; koorma matches that by treating `force_checkpoint` as
   the sole durability point. Writes without a checkpoint are lost on crash —
   *intentionally*, to mirror upstream alpha behavior.
-- **Page reclamation** — bump allocator only; old checkpoint pages + the
-  filters that reference them become garbage on each checkpoint.
 - **Separate 4 KiB node vs. 2 MiB leaf arenas** — currently one page file;
   internal nodes and filters share the leaf-sized page (wasteful).
+- **Binary free-list sidecar** — the free list is persisted as
+  comma-separated physicals in the text manifest; scales linearly in
+  the free-list size.
 
 ## Compatibility model
 

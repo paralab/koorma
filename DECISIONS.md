@@ -304,6 +304,67 @@ as Phase 1 lands).
   written filter pages), VQF filter build path (format mirrored, write
   path not wired).
 
+## 15. Phase 7 scope notes
+
+- **Bug fixed: checkpoints now preserve prior state.** Up through Phase 6,
+  `force_checkpoint` built a new tree from the memtable alone and swapped
+  it in as the root — the previous tree was orphaned in place, so *any*
+  sequence of two or more checkpoints silently lost everything the first
+  one wrote. Caught by the new `multi_checkpoint_test`. Phase 7 merges
+  the pre-existing tree with the memtable at checkpoint time and rebuilds
+  from the merged stream.
+- **Merge strategy: full-rebuild compaction.** On `force_checkpoint`:
+  1. Take a sorted memtable snapshot (as before).
+  2. If a tree already exists, `scan_tree` it (already sorted), filtering
+     out stored tombstones.
+  3. Two-pointer merge the two streams. On equal keys the memtable
+     shadows the tree. Memtable tombstones drop both the memtable slot
+     and its shadowed tree entry; they are never emitted into the new
+     tree. The final stream contains only live entries.
+  4. Feed the merged stream into the leaf+node builder.
+  This is `O(DB size + memtable size)` per checkpoint — inefficient but
+  correct. The proper turtle_kv-style incremental path (update-buffer
+  flushing down the tree as writes come in) is deferred. Acceptable
+  until working sets approach the tens of millions of keys.
+- **Deletes at checkpoint.** Tombstones never enter the written tree.
+  A memtable tombstone for a key that *wasn't* in the prior tree simply
+  disappears — there's nothing above to shadow. This matches behavioral
+  compat with turtle_kv (tombstones are a memtable/update-buffer concept).
+- **Page reclamation.** After the manifest swap, we walk the OLD root via
+  the new `tree::collect_pages` (leaves + internal nodes + per-leaf filter
+  pages) and `PageAllocator::release()` every one. `allocate()` now pops
+  the free list before advancing the bump pointer. Generation still
+  increments on every allocation, so emitted `PageId` values remain
+  unique even when the same physical slot is reused — a stale reader
+  holding an old `PageId` would see a generation mismatch on any
+  validator that checked.
+- **Why no ref-counting.** Each checkpoint produces a *wholly new* tree
+  (full rebuild). No page is shared between the old and new root, so
+  releasing the old root's pages can't free something the new root
+  still references. A future incremental-update path (update buffers,
+  COW node rewrites) would need ref-counting or epoch-based reclamation.
+- **Free list persisted in the manifest.** Each `Manifest::Device` gets
+  a `free=<comma-separated physicals>` field. Preserved via
+  `read_manifest` / `write_manifest`, seeded into the allocator at
+  `KVStore::open` via `set_free_list`. Trade-off: this grows the manifest
+  linearly in the free list's size (one decimal u32 + comma per entry).
+  For GB-scale DBs the manifest could approach a MB — fine for now but
+  a dedicated binary free-list sidecar would scale better.
+- **Safety under concurrent reads.** `force_checkpoint` holds the
+  engine `unique_lock` for the entire sequence (merge → flush → swap
+  → release → persist). `get` / `scan` take a shared lock and can't be
+  mid-walk in the old tree when we release its pages.
+- **Reclamation correctness test**
+  (`reclamation_test::NextPhysicalPlateausAcrossManyCheckpoints`): 500
+  keys, 11 rounds of overwrite+checkpoint. `next_physical` after 11
+  rounds stays within 3× the after-one-round value (steady state is
+  about 2× because during a checkpoint both old and new trees briefly
+  coexist). Without reclamation, we saw ~10× growth.
+- **Still deferred to future phases**: LLFS `Volume` layout, WAL,
+  incremental update buffers (turtle_kv's actual flush algorithm),
+  separate 4 KiB node arena vs. 2 MiB leaf arena, xxh3-compatible
+  filter content, VQF filter write path, binary free-list sidecar.
+
 ## 13. Change log
 
 - 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
@@ -319,3 +380,7 @@ as Phase 1 lands).
   `segment_filters`, walker short-circuits on filter miss. 59 tests
   passing. Filter win ~+20–26 % on misses (CPU-bound until data spills
   the page cache). pkg-config fallback for liburing.
+- 2026-04-18: Phase 7 done — fixed multi-checkpoint data loss (merge
+  existing tree with memtable before rebuilding) + page reclamation
+  via free list in the manifest. 64 tests passing. `next_physical`
+  now plateaus over many checkpoints of a fixed working set.

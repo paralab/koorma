@@ -95,6 +95,24 @@ StatusOr<Manifest> read_manifest(const std::filesystem::path& db_dir) noexcept t
         } else if (kv.key == "next_physical") {
           if (!parse_int(kv.value, d.next_physical))
             return std::unexpected{Status{ErrorCode::kCorruption}};
+        } else if (kv.key == "free") {
+          // Comma-separated list of reclaimable physical page numbers.
+          // Empty string → no free slots.
+          std::string_view rest = kv.value;
+          while (!rest.empty()) {
+            const std::size_t comma = rest.find(',');
+            const std::string_view tok =
+                comma == std::string_view::npos ? rest : rest.substr(0, comma);
+            if (!tok.empty()) {
+              std::uint32_t p = 0;
+              if (!parse_int(tok, p)) {
+                return std::unexpected{Status{ErrorCode::kCorruption}};
+              }
+              d.free_physicals.push_back(p);
+            }
+            if (comma == std::string_view::npos) break;
+            rest = rest.substr(comma + 1);
+          }
         }
       }
       if (d.page_size == 0 || d.path.empty()) {
@@ -129,7 +147,15 @@ Status write_manifest(const std::filesystem::path& db_dir, const Manifest& manif
           << " path=" << d.path.string()
           << " page_size=" << d.page_size
           << " page_capacity=" << d.page_capacity
-          << " next_physical=" << d.next_physical << "\n";
+          << " next_physical=" << d.next_physical;
+      if (!d.free_physicals.empty()) {
+        out << " free=";
+        for (std::size_t i = 0; i < d.free_physicals.size(); ++i) {
+          if (i > 0) out << ",";
+          out << d.free_physicals[i];
+        }
+      }
+      out << "\n";
     }
     out.flush();
     if (!out) return Status{ErrorCode::kIoError};

@@ -48,21 +48,22 @@ struct TreeEntry {
 
 }  // namespace
 
-StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
-    const mem::Memtable& memtable,
+StatusOr<std::uint64_t> flush_sorted_snapshot_to_checkpoint(
+    std::span<const std::pair<std::string, mem::Memtable::Slot>> snapshot,
     PageAllocator& allocator,
     std::uint32_t leaf_device_id,
     io::PageFile& leaf_file,
     std::uint32_t leaf_size,
     std::size_t filter_bits_per_key) noexcept {
 
-  if (memtable.empty()) return std::unexpected{Status{ErrorCode::kFailedPrecondition}};
   if (!leaf_file.is_writable()) {
     return std::unexpected{Status{ErrorCode::kFailedPrecondition}};
   }
-
-  const auto snapshot = memtable.merged_snapshot();
-  if (snapshot.empty()) return std::unexpected{Status{ErrorCode::kFailedPrecondition}};
+  if (snapshot.empty()) {
+    // Empty checkpoint: tree becomes empty. Caller handles the root_page_id
+    // sentinel swap + any reclamation of the old root.
+    return static_cast<std::uint64_t>(~std::uint64_t{0});
+  }
 
   const std::size_t leaf_cap = leaf_capacity_bytes(leaf_size);
 
@@ -207,6 +208,20 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
   if (!sync2.ok()) return std::unexpected{sync2};
 
   return level[0].page_id;
+}
+
+StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
+    const mem::Memtable& memtable,
+    PageAllocator& allocator,
+    std::uint32_t leaf_device_id,
+    io::PageFile& leaf_file,
+    std::uint32_t leaf_size,
+    std::size_t filter_bits_per_key) noexcept {
+  if (memtable.empty()) return std::unexpected{Status{ErrorCode::kFailedPrecondition}};
+  const auto snapshot = memtable.merged_snapshot();
+  return flush_sorted_snapshot_to_checkpoint(snapshot, allocator, leaf_device_id,
+                                             leaf_file, leaf_size,
+                                             filter_bits_per_key);
 }
 
 }  // namespace koorma::engine

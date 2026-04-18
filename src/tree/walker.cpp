@@ -153,4 +153,52 @@ Status scan_tree(const io::PageCatalog& catalog, std::uint64_t root_page_id,
   return status;
 }
 
+namespace {
+
+Status collect_subtree(const io::PageCatalog& catalog, std::uint64_t page_id,
+                       std::vector<std::uint64_t>& out) noexcept {
+  out.push_back(page_id);
+  auto bytes_or = catalog.page(page_id);
+  if (!bytes_or.has_value()) return bytes_or.error();
+  const auto bytes = *bytes_or;
+  if (bytes.size() < sizeof(format::PackedPageHeader)) {
+    return Status{ErrorCode::kCorruption};
+  }
+  const auto& hdr =
+      *reinterpret_cast<const format::PackedPageHeader*>(bytes.data());
+
+  if (hdr.layout_id == format::kLeafPageLayoutId) return Status{};
+
+  if (hdr.layout_id == format::kNodePageLayoutId) {
+    auto nv_or = NodeView::parse(bytes);
+    if (!nv_or.has_value()) return nv_or.error();
+    const std::uint32_t device = format::page_id_device(page_id);
+    const std::uint32_t generation = format::page_id_generation(page_id);
+    const std::size_t n = nv_or->pivot_count();
+    for (std::size_t i = 0; i < n; ++i) {
+      // Filter page for this child, if any.
+      const std::uint32_t filter_phys = nv_or->filter_physical_for(i);
+      if (filter_phys != 0) {
+        out.push_back(
+            format::make_page_id(device, generation, filter_phys));
+      }
+      // Child subtree.
+      const std::uint64_t child_id = nv_or->child_page_id(i);
+      auto st = collect_subtree(catalog, child_id, out);
+      if (!st.ok()) return st;
+    }
+    return Status{};
+  }
+
+  return Status{ErrorCode::kCorruption};
+}
+
+}  // namespace
+
+Status collect_pages(const io::PageCatalog& catalog,
+                     std::uint64_t root_page_id,
+                     std::vector<std::uint64_t>& out_page_ids) noexcept {
+  return collect_subtree(catalog, root_page_id, out_page_ids);
+}
+
 }  // namespace koorma::tree

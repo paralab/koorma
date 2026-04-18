@@ -1,6 +1,7 @@
 #include "engine/checkpoint_writer.hpp"
 #include "engine/manifest.hpp"
 #include "engine/page_allocator.hpp"
+#include "format/packed_page_id.hpp"
 #include "io/page_catalog.hpp"
 #include "mem/memtable.hpp"
 #include "tree/walker.hpp"
@@ -80,6 +81,7 @@ Status KVStore::create(const std::filesystem::path& dir_path, const Config& conf
       .page_size = leaf_size,
       .page_capacity = page_count,
       .next_physical = 0,
+      .free_physicals = {},
   });
 
   return engine::write_manifest(dir_path, manifest);
@@ -103,6 +105,9 @@ StatusOr<std::unique_ptr<KVStore>> KVStore::open(
         d.id, std::make_unique<io::PageFile>(std::move(*pf_or)));
     if (!reg.ok()) return std::unexpected{reg};
     impl->allocator.register_device(d.id, d.next_physical, d.page_capacity);
+    if (!d.free_physicals.empty()) {
+      impl->allocator.set_free_list(d.id, d.free_physicals);
+    }
   }
 
   return std::unique_ptr<KVStore>{new KVStore{std::move(impl)}};
@@ -279,6 +284,87 @@ StatusOr<std::size_t> KVStore::scan_keys(const KeyView& min_key,
   return *n_or;
 }
 
+namespace {
+
+// Merge a sorted memtable snapshot with a scan of the existing tree into
+// a single sorted vector of live entries. Memtable shadows the tree on
+// equal keys. Tombstones from either side drop the resulting entry (and,
+// in the memtable case, the shadowed tree entry too).
+StatusOr<std::vector<std::pair<std::string, mem::Memtable::Slot>>>
+build_merged_snapshot(const mem::Memtable& memtable,
+                      io::PageCatalog& catalog,
+                      std::uint64_t old_root) {
+  using Slot = mem::Memtable::Slot;
+  std::vector<std::pair<std::string, Slot>> mt = memtable.merged_snapshot();
+
+  if (old_root == engine::kEmptyTreeRoot) {
+    // No tree: drop tombstones from the memtable (they have nothing to
+    // suppress) and return.
+    std::vector<std::pair<std::string, Slot>> out;
+    out.reserve(mt.size());
+    for (auto& [k, s] : mt) {
+      if (s.op == ValueView::OP_DELETE) continue;
+      out.emplace_back(std::move(k), std::move(s));
+    }
+    return out;
+  }
+
+  // Collect tree entries as owned strings via scan_tree.
+  struct TreeEntry {
+    std::string key;
+    ValueView::OpCode op;
+    std::string body;
+  };
+  std::vector<TreeEntry> tree_items;
+  auto scan_st = tree::scan_tree(
+      catalog, old_root, /*min_key=*/KeyView{""},
+      [&](const KeyView& k, const ValueView& v) -> bool {
+        if (v.op() == ValueView::OP_DELETE) return true;  // skip tombstones
+        tree_items.push_back(
+            {std::string(k), v.op(), std::string(v.as_str())});
+        return true;
+      });
+  if (!scan_st.ok()) return std::unexpected{scan_st};
+
+  // 2-pointer merge. mt is sorted by key; tree_items is sorted by key.
+  std::vector<std::pair<std::string, Slot>> out;
+  out.reserve(mt.size() + tree_items.size());
+  std::size_t mi = 0, ti = 0;
+  while (mi < mt.size() && ti < tree_items.size()) {
+    auto& m = mt[mi];
+    auto& t = tree_items[ti];
+    if (m.first == t.key) {
+      // memtable shadows; drop tree; emit memtable unless it's a delete.
+      if (m.second.op != ValueView::OP_DELETE) {
+        out.emplace_back(std::move(m.first), std::move(m.second));
+      }
+      ++mi;
+      ++ti;
+    } else if (m.first < t.key) {
+      if (m.second.op != ValueView::OP_DELETE) {
+        out.emplace_back(std::move(m.first), std::move(m.second));
+      }
+      ++mi;
+    } else {
+      out.emplace_back(std::move(t.key), Slot{t.op, std::move(t.body)});
+      ++ti;
+    }
+  }
+  while (mi < mt.size()) {
+    auto& m = mt[mi++];
+    if (m.second.op != ValueView::OP_DELETE) {
+      out.emplace_back(std::move(m.first), std::move(m.second));
+    }
+  }
+  while (ti < tree_items.size()) {
+    auto& t = tree_items[ti++];
+    out.emplace_back(std::move(t.key), Slot{t.op, std::move(t.body)});
+  }
+  return out;
+}
+
+}  // namespace
+
 Status KVStore::force_checkpoint() {
   std::unique_lock lock{impl_->engine_mutex};
   if (impl_->memtable.empty()) return OkStatus();
@@ -286,22 +372,56 @@ Status KVStore::force_checkpoint() {
   auto* leaf_file = impl_->catalog.page_file(kPhase3LeafDevice);
   if (leaf_file == nullptr) return Status{ErrorCode::kInternal};
 
-  // Filters: on when compile-time KOORMA_USE_BLOOM_FILTER is set AND the
-  // tree options' bits_per_key is non-zero. Setting bits_per_key to 0 is a
-  // runtime override (used by tests + bench to disable filters).
 #ifdef KOORMA_USE_BLOOM_FILTER
   const std::size_t filter_bpk = impl_->tree_options.filter_bits_per_key();
 #else
   const std::size_t filter_bpk = 0;
 #endif
-  auto new_root_or = engine::flush_memtable_to_checkpoint(
-      impl_->memtable, impl_->allocator, kPhase3LeafDevice, *leaf_file,
-      impl_->tree_options.leaf_size(), filter_bpk);
-  if (!new_root_or.has_value()) return new_root_or.error();
 
-  impl_->manifest.root_page_id = *new_root_or;
+  const std::uint64_t old_root = impl_->manifest.root_page_id;
+
+  // Merge memtable with existing tree (if any) into a single sorted stream
+  // of live entries. This is a full-rebuild compaction — O(DB size) per
+  // checkpoint; a proper incremental upsert path is future work.
+  auto merged_or =
+      build_merged_snapshot(impl_->memtable, impl_->catalog, old_root);
+  if (!merged_or.has_value()) return merged_or.error();
+  const auto& merged = *merged_or;
+
+  std::uint64_t new_root;
+  if (merged.empty()) {
+    // Everything got deleted. New tree is empty.
+    new_root = engine::kEmptyTreeRoot;
+  } else {
+    auto new_root_or = engine::flush_sorted_snapshot_to_checkpoint(
+        merged, impl_->allocator, kPhase3LeafDevice, *leaf_file,
+        impl_->tree_options.leaf_size(), filter_bpk);
+    if (!new_root_or.has_value()) return new_root_or.error();
+    new_root = *new_root_or;
+  }
+
+  // Swap root + push allocator state into the manifest before reclamation,
+  // so the manifest-on-disk always describes live pages even if the
+  // reclamation step aborts partway through.
+  impl_->manifest.root_page_id = new_root;
+
+  // Reclaim old tree pages (if any). This is safe under unique_lock —
+  // no concurrent reader is mid-walk on the old tree.
+  if (old_root != engine::kEmptyTreeRoot) {
+    std::vector<std::uint64_t> old_pages;
+    auto collect_st =
+        tree::collect_pages(impl_->catalog, old_root, old_pages);
+    if (!collect_st.ok()) return collect_st;
+    for (const auto id : old_pages) {
+      const std::uint32_t dev = format::page_id_device(id);
+      const std::uint32_t phys = format::page_id_physical(id);
+      impl_->allocator.release(dev, phys);
+    }
+  }
+
   for (auto& d : impl_->manifest.devices) {
     d.next_physical = impl_->allocator.next_physical(d.id);
+    d.free_physicals = impl_->allocator.free_list(d.id);
   }
   auto st = engine::write_manifest(impl_->dir_path, impl_->manifest);
   if (!st.ok()) return st;

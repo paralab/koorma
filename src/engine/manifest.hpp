@@ -32,6 +32,7 @@ struct Manifest {
     std::uint32_t page_size = 0;
     std::uint32_t page_capacity = 0; // total pages allocated (file size / page_size)
     std::uint32_t next_physical = 0; // next bump-allocator slot
+    std::vector<std::uint32_t> free_physicals;  // reclaimable slots
   };
 
   std::uint32_t version = 1;

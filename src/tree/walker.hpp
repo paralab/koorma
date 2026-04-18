@@ -7,6 +7,7 @@
 #include <koorma/value_view.hpp>
 
 #include <functional>
+#include <vector>
 
 namespace koorma::tree {
 
@@ -30,5 +31,13 @@ using ScanCallback = std::function<bool(const KeyView&, const ValueView&)>;
 
 Status scan_tree(const io::PageCatalog& catalog, std::uint64_t root_page_id,
                  const KeyView& min_key, const ScanCallback& cb) noexcept;
+
+// Enumerate every page id reachable from `root_page_id`: the root itself,
+// every internal node, every leaf, and every companion filter page that a
+// parent node references via its `segment_filters` directory. Output is
+// deduplicated in caller order; caller wants the full set for reclamation.
+Status collect_pages(const io::PageCatalog& catalog,
+                     std::uint64_t root_page_id,
+                     std::vector<std::uint64_t>& out_page_ids) noexcept;
 
 }  // namespace koorma::tree
