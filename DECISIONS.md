@@ -430,6 +430,72 @@ as Phase 1 lands).
   node-arena vs. leaf-arena, xxh3-compatible filter content, VQF
   write path, binary free-list sidecar.
 
+## 17. Phase 9 scope notes
+
+- **Multi-level flush cascade.** Phase 8's root-only buffer now overflows
+  into a proper B-epsilon flush instead of falling back to full rebuild.
+  `engine::try_incremental_checkpoint` first tries to absorb the combined
+  (old buffer + memtable) into a new root buffer (O(root page) write);
+  on buffer overflow, it calls `apply_entries_node` which groups entries
+  by pivot and recurses into each affected child. Leaves absorb by
+  merge-rewrite; intermediate nodes absorb-or-recurse.
+- **`apply_entries_rec` contract.** Given a page_id + a batch of sorted,
+  shadowed entries:
+  - Leaf → merge-rewrite via `tree::merge_rebuild_leaf`; return
+    `(new_leaf_id, [old_leaf_id])`.
+  - Internal node → merge entries with existing buffer; try new-buffer
+    write first; on overflow, route entries to children and recurse;
+    build new node with empty buffer + updated children[].
+  - Returns `kResourceExhausted` if any leaf would overflow (no splits in
+    Phase 9). On any error mid-cascade, all pages allocated during this
+    attempt are released back to the allocator before bubbling up.
+  - `ApplyResult::released_pages` is the exact set of OLD pages the
+    caller should release after the manifest swap (old root, rewritten
+    nodes, rewritten leaves, and their old filter pages). Unaffected
+    children stay live under the new tree — no per-leaf walk needed.
+- **Merge-rebuild at leaves.** `tree::merge_rebuild_leaf` decodes the old
+  leaf's sorted items, 2-pointer merges with incoming entries (sorted),
+  incoming shadows on equal key, tombstones drop. Empty merged output
+  returns `kNotFound` (signals "leaf should be removed" — rare; Phase 9
+  treats this as overflow and falls back to full rebuild to sidestep
+  the "empty child" problem, which would need pivot fixup).
+- **No splits in Phase 9.** A leaf that would overflow on merge aborts
+  the cascade → full rebuild. A node with pivot_count already at
+  `kMaxPivots=64` can't take new children (not possible to hit today
+  since flush never ADDS pivots; it only rewrites existing ones). Split
+  support is deferred: it's the next natural step but needs split-
+  propagation logic that touches every ancestor.
+- **Filter coverage regression.** Phase 6's per-leaf filter array
+  (`segment_filters`) can't coexist with a node buffer (both want
+  trailer space — Phase 8). In Phase 9, every flushed node is written
+  with an empty buffer + no filter array. Result: intermediate-node
+  filter coverage erodes as flushes cascade. Full rebuilds restore
+  filters. Future fix: either dual-location filter IDs, or move to
+  turtle_kv's proper `PackedUpdateBuffer` + `PackedSegment` layout
+  where filters ride alongside pending segments.
+- **Concurrency unchanged.** Same `engine_mutex` discipline. Flush
+  allocates + writes pages under the unique lock; the manifest swap
+  publishes the new root atomically; released-pages list is handed
+  off to the allocator after the swap.
+- **What this gets us.** Typical checkpoint cost:
+  - All entries fit in root buffer → O(root page) (Phase 8 path).
+  - Root buffer overflow → flush: O(affected leaves + ancestors of
+    affected leaves) — NOT O(DB size). For localized update patterns
+    (hot keys in a few leaves) this is a dramatic win.
+  - Measured: `flush_test::OverflowFlushesPartialTree` shows 30 rounds
+    of small checkpoints against a 900-key tree grow `next_physical`
+    by <100 pages; a full-rebuild fallback would have consumed ≥330.
+- **What it doesn't get us.** Real turtle_kv's B-epsilon includes:
+  - Splits (leaf and node), which koorma still punts to full rebuild.
+  - Filters per pending segment (`PackedSegment::filter_start` +
+    `segment_filters` as turtle_kv intended). Koorma's filters sit at
+    flushed-child granularity, not pending-segment granularity.
+  - The actual `PackedUpdateBuffer` / `PackedSegment` byte layout.
+    Koorma's koorma-private magic-footer encoding remains.
+- **Still deferred**: LLFS `Volume` layout, WAL, splits, proper
+  `PackedUpdateBuffer` format, separate node/leaf arenas, xxh3 filter
+  content, VQF write path, binary free-list sidecar.
+
 ## 13. Change log
 
 - 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
@@ -454,3 +520,10 @@ as Phase 1 lands).
   oversized batches fall back to full rebuild. 73 tests passing.
   Walker probes the buffer before routing; `scan_tree` merges buffer
   entries with the child scan in sorted order.
+- 2026-04-18: Phase 9 done — multi-level B-epsilon flush cascade.
+  Root-buffer overflow now routes entries to affected children:
+  leaves merge-rebuild, intermediate nodes absorb-or-recurse. Only
+  affected pages are rewritten (full rebuild remains the fallback on
+  leaf overflow). 77 tests passing. Verified that 30 small-batch
+  checkpoints grow next_physical by <100 pages (vs. >330 for full
+  rebuild).

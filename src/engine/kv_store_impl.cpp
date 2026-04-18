@@ -445,13 +445,17 @@ Status KVStore::force_checkpoint() {
 
   std::uint64_t new_root = engine::kEmptyTreeRoot;
   bool did_incremental = false;
+  std::vector<std::uint64_t> incremental_released;
 
-  // --- Try the incremental (root-buffer-append) path first -----------
+  // --- Try the incremental (root-buffer-append / cascade flush) path ---
   //
-  // Applicable when: (a) old root exists and is an internal node, and
-  // (b) the combined (existing root buffer + memtable) fits in a new
-  // root page's trailer. On success, children are untouched — only the
-  // root page is rewritten, so checkpoint cost is O(root size).
+  // Applicable when the old root exists and is an internal node.
+  // try_incremental_checkpoint first tries to absorb entries into a new
+  // root buffer (O(root page) write — Phase 8), and on overflow cascades
+  // into the children via apply_entries (Phase 9): affected leaves
+  // merge-rebuild, intermediate nodes absorb-or-flush recursively.
+  // The ApplyResult carries the exact list of old pages to release
+  // (unaffected children stay live under the new root).
   if (old_root != engine::kEmptyTreeRoot) {
     auto bytes_or = impl_->catalog.page(old_root);
     const bool root_is_node =
@@ -470,7 +474,8 @@ Status KVStore::force_checkpoint() {
           kPhase3LeafDevice, *leaf_file,
           impl_->tree_options.leaf_size());
       if (inc_or.has_value()) {
-        new_root = *inc_or;
+        new_root = inc_or->new_page_id;
+        incremental_released = std::move(inc_or->released_pages);
         did_incremental = true;
       }
       // Else: fall through to full rebuild.
@@ -500,24 +505,23 @@ Status KVStore::force_checkpoint() {
   impl_->manifest.root_page_id = new_root;
 
   // Reclaim old tree pages:
-  //   - Incremental: only the old root page is orphaned (children still
-  //     referenced from the new root).
-  //   - Full rebuild: the entire old subtree is orphaned.
-  if (old_root != engine::kEmptyTreeRoot) {
-    if (did_incremental) {
-      const std::uint32_t dev = format::page_id_device(old_root);
-      const std::uint32_t phys = format::page_id_physical(old_root);
+  //   - Incremental: release exactly what apply_entries said to release
+  //     (root + rewritten nodes + rewritten leaves + old filter pages).
+  //   - Full rebuild: release the entire old subtree.
+  if (did_incremental) {
+    for (const auto id : incremental_released) {
+      impl_->allocator.release(format::page_id_device(id),
+                               format::page_id_physical(id));
+    }
+  } else if (old_root != engine::kEmptyTreeRoot) {
+    std::vector<std::uint64_t> old_pages;
+    auto collect_st =
+        tree::collect_pages(impl_->catalog, old_root, old_pages);
+    if (!collect_st.ok()) return collect_st;
+    for (const auto id : old_pages) {
+      const std::uint32_t dev = format::page_id_device(id);
+      const std::uint32_t phys = format::page_id_physical(id);
       impl_->allocator.release(dev, phys);
-    } else {
-      std::vector<std::uint64_t> old_pages;
-      auto collect_st =
-          tree::collect_pages(impl_->catalog, old_root, old_pages);
-      if (!collect_st.ok()) return collect_st;
-      for (const auto id : old_pages) {
-        const std::uint32_t dev = format::page_id_device(id);
-        const std::uint32_t phys = format::page_id_physical(id);
-        impl_->allocator.release(dev, phys);
-      }
     }
   }
 

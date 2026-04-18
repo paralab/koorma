@@ -14,6 +14,7 @@ target_sources(koorma_core PRIVATE
   format/root_buffer.cpp
   tree/leaf_view.cpp
   tree/leaf_builder.cpp
+  tree/leaf_rebuild.cpp
   tree/node_view.cpp
   tree/node_builder.cpp
   tree/walker.cpp

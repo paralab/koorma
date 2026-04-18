@@ -8,7 +8,7 @@ Design rationale and all architectural choices live in
 [**DECISIONS.md**](./DECISIONS.md). On-disk byte layouts live in
 [**FORMAT.md**](./FORMAT.md). This README tracks *status*.
 
-## Status (as of Phase 8)
+## Status (as of Phase 9)
 
 | # | Phase | Status | Highlights |
 |---|---|---|---|
@@ -20,8 +20,9 @@ Design rationale and all architectural choices live in
 | 6 | Bloom filters + walker integration | ✅ done | Per-leaf `PackedBloomFilterPage`, parent node stores filter IDs in `segment_filters`, walker short-circuits on filter miss — **+20–26 % on missing-key `get()`** |
 | 7 | Persistent multi-checkpoint + reclamation | ✅ done | Fixed silent data loss across checkpoints (merge old tree + memtable), per-device free list in the manifest, `allocate()` prefers freed slots; `next_physical` now plateaus over many checkpoints |
 | 8 | Root-level update buffer | ✅ done | Small-batch checkpoints absorb into the root node's buffer instead of rebuilding leaves — **O(root page) per checkpoint** for typical churn. Walker probes buffer before routing; `scan_tree` merges buffer with child scan. Koorma-private buffer encoding (turtle_kv `PackedUpdateBuffer` reinterpretation still deferred). |
+| 9 | Multi-level B-epsilon flush cascade | ✅ done | Root-buffer overflow now routes entries down: leaves merge-rebuild, intermediate nodes absorb-or-recurse. **Only affected pages rewritten** — 30 small-batch checkpoints grow next_physical by <100 pages (vs. >330 for full rebuild). Splits/nodes-at-pivot-cap still fall back to full rebuild. |
 
-**Totals**: 7,007 LoC across 76 files · 73 gtest cases · 0 data races under `-fsanitize=thread` (Phase 5 verification; subsequent changes are guarded by the existing `engine_mutex`, unchanged concurrency surface).
+**Totals**: 7,639 LoC across 78 files · 77 gtest cases · 0 data races under `-fsanitize=thread` (Phase 5 verification; subsequent changes are guarded by the existing `engine_mutex`, unchanged concurrency surface).
 
 ## What works right now
 
@@ -29,11 +30,12 @@ Design rationale and all architectural choices live in
 - `put(key, value)` / `get(key)` / `remove(key)` / `scan(min_key, items_out)`
 - `force_checkpoint()` — first tries the **incremental** path: merges the
   memtable into the root node's update buffer and rewrites just the root
-  page, reusing the children (O(root page) per checkpoint). If the merged
-  buffer overflows, falls back to a **full-rebuild** path: merge memtable
-  with a scan of the existing tree, then build a new tree from scratch.
-  Old pages are released back to a per-device free list that survives a
-  reopen.
+  page (O(root page) per checkpoint). On buffer overflow, **cascades**
+  via `apply_entries`: routes entries to affected children; leaves
+  merge-rebuild, intermediate nodes absorb-or-recurse. Unaffected
+  subtrees stay live under the new root. On leaf overflow (no split
+  support yet) falls back to the **full-rebuild** path. Old pages go
+  to a per-device free list that survives a reopen.
 - Concurrent `put`/`get`/`remove` from many threads (sharded memtable)
 - **Bloom filters on the read path** — `get()` on a missing key short-
   circuits at the parent node without touching the leaf. Runtime-toggleable
@@ -48,22 +50,25 @@ Design rationale and all architectural choices live in
 
 ## What's deferred
 
-(See [DECISIONS.md §16](./DECISIONS.md#16-phase-8-scope-notes) for full rationale.)
+(See [DECISIONS.md §17](./DECISIONS.md#17-phase-9-scope-notes) for full rationale.)
 
 - **LLFS `Volume` directory layout** — koorma currently reads/writes its own
   `koorma.manifest` bootstrap format. Opening databases written by real
   turtle_kv requires reverse-engineering LLFS's slotted-log + volume root.
-- **Multi-level update buffers** — Phase 8 buffers only at the root. Real
-  turtle_kv buffers at every internal node and flushes level-by-level
-  when a node's buffer saturates (B-epsilon tree semantics). Koorma
-  overflows into a full rebuild instead. Wiring the real flush algorithm
-  would also switch our buffer codec from the koorma-private footer to
-  turtle_kv's `PackedUpdateBuffer` / `PackedSegment` layout.
+- **Splits** — no leaf or node split support. On overflow mid-cascade we
+  fall back to full rebuild. Proper B-epsilon would split the affected
+  leaf/node and propagate the new pivot up the tree.
+- **`PackedUpdateBuffer` / `PackedSegment` layout** — koorma's buffer
+  encoding is a magic-footer scheme placed past `unused_begin`. Moving
+  to turtle_kv's segment/filter layout would unlock per-segment filters
+  and real interop.
 - **xxh3-compatible filter contents** — koorma writes the LLFS bloom-filter
   *frame* format, but the bit positions are computed from `absl::Hash`
   rather than xxh3. Real turtle_kv filter pages would need xxh3 to probe.
-- **Internal-node filter aggregation** — filters are built at the leaf
-  level; parents-of-parents descend without a filter probe.
+- **Intermediate-node filter coverage** — filters are wired only at nodes
+  with no buffer. After a flush cascade, flushed intermediate nodes have
+  empty buffers AND no filter array; filter coverage erodes over churn.
+  Full rebuilds restore it.
 - **VQF filter build path** — format is mirrored, write path not wired.
 - **WAL / change log** — turtle_kv's own `pack_change_log_slot` is TODO at
   our pinned commit; koorma matches that by treating `force_checkpoint` as

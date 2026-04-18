@@ -43,22 +43,32 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
     std::uint32_t leaf_size,
     std::size_t filter_bits_per_key = 0) noexcept;
 
-// Phase 8: incremental checkpoint. Attempt to write a new root node whose
-// pending-update buffer carries `entries` (memtable entries merged with
-// any entries from the OLD root's existing buffer). The existing tree
-// below the root is reused as-is — its pages stay live.
+// Result of an incremental/flush attempt.
+struct ApplyResult {
+  std::uint64_t new_page_id;
+  // Old pages the caller should release_to_allocator() AFTER the manifest
+  // swap succeeds: the old root, any rewritten intermediate nodes, any
+  // rewritten leaves, and the filter pages those nodes referenced.
+  // Does NOT include unaffected children that stayed live under the new
+  // tree — those are reused in place.
+  std::vector<std::uint64_t> released_pages;
+};
+
+// Phase 8+9: try an incremental checkpoint on top of an existing tree.
+//
+// First attempts to fit `entries` (already sorted, shadowed) into a new
+// root node's update buffer — O(root page) when successful. On buffer
+// overflow (Phase 9 path), distributes entries to affected children:
+// leaves merge-rebuild, internal nodes recursively absorb-or-flush.
 //
 // Returns:
-//   - new root page id on success.
-//   - std::unexpected(kResourceExhausted) if entries don't fit in a
-//     single node-trailer buffer (caller should fall back to full
-//     rebuild).
-//   - std::unexpected(kInvalidArgument) if the old root isn't an internal
-//     node (no point buffering above a single leaf — caller rebuilds).
-//
-// IMPORTANT: this does NOT release the old root's page. The caller is
-// responsible for releasing the old root after the manifest swap.
-StatusOr<std::uint64_t> try_incremental_checkpoint(
+//   - ApplyResult on success (new root id + old pages to release).
+//   - std::unexpected(kResourceExhausted) if a leaf would overflow
+//     anywhere in the cascade — caller must fall back to full rebuild
+//     (Phase 9 has no split support).
+//   - std::unexpected(kInvalidArgument) if the old root isn't an
+//     internal node (no flush path above a single leaf).
+StatusOr<ApplyResult> try_incremental_checkpoint(
     const io::PageCatalog& catalog,
     std::uint64_t old_root_page_id,
     std::span<const format::RootBufferEntry> entries,
