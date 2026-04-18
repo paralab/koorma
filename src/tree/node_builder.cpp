@@ -1,5 +1,6 @@
 #include "tree/node_builder.hpp"
 
+#include "format/packed_array.hpp"
 #include "format/packed_node.hpp"
 #include "format/page_layout.hpp"
 #include "format/page_layout_id.hpp"
@@ -11,10 +12,14 @@ namespace koorma::tree {
 
 Status build_node_page(std::span<std::uint8_t> out, std::uint64_t page_id, std::uint8_t height,
                        std::span<const std::pair<KeyView, std::uint64_t>> pivots,
-                       const KeyView& max_key) noexcept {
+                       const KeyView& max_key,
+                       std::span<const std::uint32_t> filter_physicals) noexcept {
   using namespace koorma::format;
 
   if (pivots.empty() || pivots.size() > kMaxPivots) {
+    return Status{ErrorCode::kInvalidArgument};
+  }
+  if (!filter_physicals.empty() && filter_physicals.size() != pivots.size()) {
     return Status{ErrorCode::kInvalidArgument};
   }
   if (out.size() < sizeof(PackedPageHeader) + sizeof(PackedNodePage)) {
@@ -90,6 +95,44 @@ Status build_node_page(std::span<std::uint8_t> out, std::uint64_t page_id, std::
     const std::uint64_t byte_dist = static_cast<std::uint64_t>(
         trailer_write - reinterpret_cast<const std::uint8_t*>(&pk->pointer));
     node.pivot_keys_[slot].pointer.offset = static_cast<std::uint16_t>(byte_dist);
+  }
+
+  // --- filter-id array (optional) ---------------------------------------
+  // Layout in the trailer, right after the pivot keys:
+  //   [align-to-4] PackedArray<little_u32> header  (4 bytes)
+  //               + little_u32[pivots.size()] entries  (4 bytes each)
+  // update_buffer.segment_filters is a self-relative PackedPointer pointing
+  // to the PackedArray header. NodeView reads it back via the pointer.
+  if (!filter_physicals.empty()) {
+    // Align trailer_write up to 4 bytes.
+    const std::uintptr_t write_addr =
+        reinterpret_cast<std::uintptr_t>(trailer_write);
+    const std::uintptr_t aligned = (write_addr + 3u) & ~std::uintptr_t{3u};
+    trailer_write = reinterpret_cast<std::uint8_t*>(aligned);
+
+    const std::size_t array_bytes = sizeof(PackedArray<little_u32>) +
+                                    filter_physicals.size() * sizeof(little_u32);
+    if (trailer_write + array_bytes > trailer_end_limit) {
+      return Status{ErrorCode::kResourceExhausted};
+    }
+
+    auto* arr = reinterpret_cast<PackedArray<little_u32>*>(trailer_write);
+    arr->size_ = static_cast<std::uint32_t>(filter_physicals.size());
+    auto* entries = reinterpret_cast<little_u32*>(
+        trailer_write + sizeof(PackedArray<little_u32>));
+    for (std::size_t i = 0; i < filter_physicals.size(); ++i) {
+      entries[i] = filter_physicals[i];
+    }
+
+    // Set update_buffer.segment_filters pointer (2-byte self-relative
+    // offset from the field to the array header).
+    const auto* sf_field = &node.update_buffer.segment_filters;
+    const std::uint64_t byte_dist = static_cast<std::uint64_t>(
+        trailer_write - reinterpret_cast<const std::uint8_t*>(sf_field));
+    node.update_buffer.segment_filters.offset =
+        static_cast<std::uint16_t>(byte_dist);
+
+    trailer_write += array_bytes;
   }
 
   hdr.unused_begin =

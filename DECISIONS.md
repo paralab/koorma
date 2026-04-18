@@ -252,6 +252,58 @@ as Phase 1 lands).
   - Page reclamation / ref-counting.
   - Separate 4 KiB node arena vs. 2 MiB leaf arena.
 
+## 14. Phase 6 scope notes
+
+- **Per-leaf Bloom filters.** At checkpoint time each leaf gets a
+  companion `PackedBloomFilterPage` (LLFS layout: 96 B prefix + `u64[]`
+  words). Filter pages are allocated from the same bump allocator and
+  live in the same arena as leaves.
+- **Wiring into parent nodes.** The parent's
+  `update_buffer.segment_filters` field is a
+  `PackedPointer<PackedArray<little_u32>, little_u16>`; we populate it
+  with one filter-page *physical page number* per child, placed in the
+  node trailer right after the pivot keys. That's the field's intended
+  purpose — we're just using it for per-child flushed filters instead
+  of per-segment pending-update filters (checkpoint-written nodes have
+  no pending segments).
+- **Walker integration.** After routing to child `i` at an internal
+  node, the walker reads `segment_filters[i]`. If the filter says
+  "definitely absent", `get()` returns kNotFound without touching the
+  leaf. If the filter page fails to parse, we fall through and read
+  the leaf — the filter is an optimization, never a source of truth.
+- **Hash function.** `absl::Hash<string_view>` for h1; a Wyhash-style
+  mixer derives h2 from h1. Kirsch–Mitzenmacher double-hashing for k
+  probes. LLFS proper uses xxh3, so koorma's filter *contents* are NOT
+  byte-compatible with turtle_kv — only the page frame layout is.
+  Reading real turtle_kv filter pages would require the xxh3 path.
+- **Sizing.** Default `TreeOptions::filter_bits_per_key = 12` (via the
+  existing field) ⇒ ~3 % theoretical FP rate with k = 8.
+  `set_filter_bits_per_key(0)` is a runtime opt-out (used by tests +
+  bench A/B). `-DKOORMA_USE_BLOOM_FILTER=OFF` is the compile-time
+  opt-out — removes the wiring altogether.
+- **Single-leaf trees skip filters.** When a checkpoint produces a
+  single leaf there's no parent to hold the filter-id array, so no
+  filter is allocated. Tiny DBs pay no filter overhead.
+- **Internal-node filters not aggregated.** Filters are built at the
+  leaf→parent level only. Parents-of-parents route without filter
+  consultation. A future phase can aggregate child filters upward if
+  multi-level miss skipping matters.
+- **Bench delta** (Release, 16 KiB leaves, even keys inserted / odd
+  keys probed as misses so every miss routes to a different leaf):
+  - n=10 k:  miss 9.8 Mops/s (filter on) vs. 8.2 Mops/s (off) → ~+20 %.
+  - n=100 k: miss 7.8 Mops/s (filter on) vs. 6.2 Mops/s (off) → ~+26 %.
+  - get-hit is ~5 % slower with filters on (extra filter probe), since
+    L2-resident workloads pay CPU cost but get no I/O savings.
+    The win grows on data that spills the page cache (not benched).
+- **Build path.** `find_package(liburing REQUIRED)` now auto-falls-back
+  to `pkg_check_modules` when no CMake config file is found — Arch and
+  most other distros ship liburing via pkg-config only.
+- **Still deferred to future phases**: LLFS `Volume` layout, WAL, page
+  reclamation, separate 4 KiB node arena vs. 2 MiB leaf arena,
+  xxh3-compatible filter content (needed for reading real turtle_kv-
+  written filter pages), VQF filter build path (format mirrored, write
+  path not wired).
+
 ## 13. Change log
 
 - 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
@@ -263,3 +315,7 @@ as Phase 1 lands).
   with internal node, scan, concurrent put/get. 49 tests passing.
 - 2026-04-17: Phase 5 done — multi-level trees, TSAN clean, bench
   harness + baseline numbers. 50 tests passing + 0 TSAN races.
+- 2026-04-18: Phase 6 done — per-leaf Bloom filters wired into parent
+  `segment_filters`, walker short-circuits on filter miss. 59 tests
+  passing. Filter win ~+20–26 % on misses (CPU-bound until data spills
+  the page cache). pkg-config fallback for liburing.

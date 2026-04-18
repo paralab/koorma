@@ -31,8 +31,15 @@ namespace koorma::tree {
 // All pivot keys + max_key get concatenated into key_and_flushed_item_data_.
 // The update buffer is zeroed (no pending edits; fresh checkpoint).
 // Returns kResourceExhausted if keys don't fit in the trailer region.
+//
+// If `filter_physicals` is non-empty, it must have exactly pivots.size()
+// entries — one filter-page physical number per child (0 means "no filter
+// for this child"). These are written as a `PackedArray<little_u32>` in
+// the trailer right after the pivot keys, and `update_buffer.segment_filters`
+// is pointed at it. NodeView::filter_physical_for(child_i) reads them back.
 Status build_node_page(std::span<std::uint8_t> out, std::uint64_t page_id, std::uint8_t height,
                        std::span<const std::pair<KeyView, std::uint64_t>> pivots,
-                       const KeyView& max_key) noexcept;
+                       const KeyView& max_key,
+                       std::span<const std::uint32_t> filter_physicals = {}) noexcept;
 
 }  // namespace koorma::tree

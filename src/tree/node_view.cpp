@@ -1,5 +1,6 @@
 #include "tree/node_view.hpp"
 
+#include "format/packed_array.hpp"
 #include "format/page_layout.hpp"
 #include "format/page_layout_id.hpp"
 
@@ -41,6 +42,14 @@ KeyView NodeView::pivot_at(std::size_t i) const noexcept {
 
 std::uint64_t NodeView::child_page_id(std::size_t pivot_i) const noexcept {
   return node_->children[pivot_i].unpack();
+}
+
+std::uint32_t NodeView::filter_physical_for(std::size_t pivot_i) const noexcept {
+  using namespace koorma::format;
+  const auto* arr = node_->update_buffer.segment_filters.get();
+  if (arr == nullptr) return 0;
+  if (pivot_i >= arr->size()) return 0;
+  return static_cast<std::uint32_t>(arr->data()[pivot_i]);
 }
 
 std::size_t NodeView::route(const KeyView& key) const noexcept {

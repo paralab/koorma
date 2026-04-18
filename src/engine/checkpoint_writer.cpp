@@ -1,5 +1,6 @@
 #include "engine/checkpoint_writer.hpp"
 
+#include "format/bloom_filter.hpp"
 #include "format/packed_array.hpp"
 #include "format/packed_key_value.hpp"
 #include "format/packed_leaf.hpp"
@@ -35,10 +36,12 @@ std::size_t leaf_capacity_bytes(std::size_t leaf_size) noexcept {
 
 // A single entry at any tree level: its min-key (routing key) + the
 // page id of the subtree rooted there. `key_storage` owns the key bytes
-// so entries can outlive per-leaf input buffers.
+// so entries can outlive per-leaf input buffers. `filter_physical` is 0
+// if no filter page was built for this entry's subtree.
 struct TreeEntry {
   std::string key_storage;
   std::uint64_t page_id;
+  std::uint32_t filter_physical{0};
 
   KeyView key() const noexcept { return KeyView{key_storage}; }
 };
@@ -50,7 +53,8 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
     PageAllocator& allocator,
     std::uint32_t leaf_device_id,
     io::PageFile& leaf_file,
-    std::uint32_t leaf_size) noexcept {
+    std::uint32_t leaf_size,
+    std::size_t filter_bits_per_key) noexcept {
 
   if (memtable.empty()) return std::unexpected{Status{ErrorCode::kFailedPrecondition}};
   if (!leaf_file.is_writable()) {
@@ -102,10 +106,32 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
     }
     auto build = tree::build_leaf_page(page_span, page_id, items);
     if (!build.ok()) return std::unexpected{build};
-    level.push_back({snapshot[begin].first, page_id});
+
+    std::uint32_t filter_phys = 0;
+    // Only build a per-leaf filter when we'll have a parent node above us
+    // (i.e., more than one leaf). Single-leaf trees have nowhere to store
+    // the filter pointer.
+    if (filter_bits_per_key > 0 && leaf_starts.size() > 1) {
+      std::vector<KeyView> keys;
+      keys.reserve(end - begin);
+      for (std::size_t i = begin; i < end; ++i) {
+        keys.emplace_back(KeyView{snapshot[i].first});
+      }
+      auto f_id_or = allocator.allocate(leaf_device_id);
+      if (!f_id_or.has_value()) return std::unexpected{f_id_or.error()};
+      const std::uint64_t f_id = *f_id_or;
+      const std::uint32_t f_phys = format::page_id_physical(f_id);
+      auto f_span = leaf_file.mutable_page(f_phys);
+      auto f_st = format::build_bloom_filter_page(
+          f_span, page_id, keys, filter_bits_per_key);
+      if (!f_st.ok()) return std::unexpected{f_st};
+      filter_phys = f_phys;
+    }
+
+    level.push_back({snapshot[begin].first, page_id, filter_phys});
   }
 
-  // Sync leaf pages before we reference them from nodes above.
+  // Sync leaf + filter pages before we reference them from nodes above.
   auto sync = leaf_file.sync();
   if (!sync.ok()) return std::unexpected{sync};
 
@@ -129,10 +155,22 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
       const std::size_t end = std::min(start + per_group, level.size());
 
       std::vector<std::pair<KeyView, std::uint64_t>> pivots;
+      std::vector<std::uint32_t> filter_phys;
       pivots.reserve(end - start);
+      filter_phys.reserve(end - start);
+      bool any_filter = false;
       for (std::size_t i = start; i < end; ++i) {
         pivots.emplace_back(level[i].key(), level[i].page_id);
+        filter_phys.push_back(level[i].filter_physical);
+        if (level[i].filter_physical != 0) any_filter = true;
       }
+      // Only wire filter_physicals into the node if at least one child has
+      // a filter. Otherwise pass {} to preserve the no-filters node layout.
+      std::span<const std::uint32_t> fp_span;
+      if (any_filter) {
+        fp_span = std::span<const std::uint32_t>{filter_phys};
+      }
+
       // The upper-bound key for this node: next level's first key, or
       // the global last_key if this is the rightmost group.
       const KeyView node_max_key = (end < level.size()) ? level[end].key() : last_key;
@@ -142,11 +180,16 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
       const std::uint64_t node_id = *node_id_or;
       const std::uint32_t phys = format::page_id_physical(node_id);
       auto node_span = leaf_file.mutable_page(phys);
-      auto build_node =
-          tree::build_node_page(node_span, node_id, height, pivots, node_max_key);
+      auto build_node = tree::build_node_page(node_span, node_id, height,
+                                              pivots, node_max_key, fp_span);
       if (!build_node.ok()) return std::unexpected{build_node};
 
-      next_level.push_back({level[start].key_storage, node_id});
+      // This new node's filter_physical is 0 — we don't build filters for
+      // internal nodes in Phase 6 (only leaves). Parent nodes of internal
+      // nodes thus get no filters themselves, and the walker will simply
+      // descend without probing for multi-level trees above the leaf
+      // parents. Future phase can aggregate child filters.
+      next_level.push_back({level[start].key_storage, node_id, 0});
     }
 
     level = std::move(next_level);

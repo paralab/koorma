@@ -23,7 +23,17 @@ if(KOORMA_USE_BLOOM_FILTER AND KOORMA_USE_QUOTIENT_FILTER)
 endif()
 
 find_package(absl REQUIRED)
-find_package(liburing REQUIRED)
+# liburing ships no CMake config on most distros, so try both paths: a
+# CONFIG-mode find first, then pkg-config. Exposes an imported target
+# liburing::liburing either way.
+find_package(liburing CONFIG QUIET)
+if(NOT liburing_FOUND)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(liburing REQUIRED IMPORTED_TARGET liburing)
+  if(NOT TARGET liburing::liburing)
+    add_library(liburing::liburing ALIAS PkgConfig::liburing)
+  endif()
+endif()
 find_package(spdlog REQUIRED)
 find_package(fmt REQUIRED)
 # vqf is vendored or found via Conan; wired in src/mem/CMakeLists.txt

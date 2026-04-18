@@ -29,6 +29,11 @@ class NodeView {
   // node's pivot ordering. Assumes key is within [min_key, max_key].
   std::size_t route(const KeyView& key) const noexcept;
 
+  // If this node has a filter-id array wired in (see node_builder), return
+  // the filter page's physical page number for child `pivot_i`. 0 means
+  // "no filter". Returns 0 if the node was built without filter_physicals.
+  std::uint32_t filter_physical_for(std::size_t pivot_i) const noexcept;
+
  private:
   explicit NodeView(const format::PackedNodePage* node) noexcept : node_{node} {}
   const format::PackedNodePage* node_;

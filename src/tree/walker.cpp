@@ -1,5 +1,7 @@
 #include "tree/walker.hpp"
 
+#include "format/bloom_filter.hpp"
+#include "format/packed_page_id.hpp"
 #include "format/page_layout.hpp"
 #include "format/page_layout_id.hpp"
 #include "tree/leaf_view.hpp"
@@ -56,6 +58,29 @@ StatusOr<ValueView> get(const io::PageCatalog& catalog, std::uint64_t root_page_
       auto nv_or = NodeView::parse(bytes);
       if (!nv_or.has_value()) return std::unexpected{nv_or.error()};
       const std::size_t pivot_i = nv_or->route(key);
+
+      // Filter check: if the parent recorded a filter for this child,
+      // probe it before descending. A negative probe ⇒ definitely not
+      // present in that subtree, short-circuit to NotFound.
+      const std::uint32_t filter_phys = nv_or->filter_physical_for(pivot_i);
+      if (filter_phys != 0) {
+        const std::uint32_t device =
+            format::page_id_device(page_id);
+        const std::uint32_t generation =
+            format::page_id_generation(page_id);
+        const std::uint64_t filter_page_id =
+            format::make_page_id(device, generation, filter_phys);
+        auto f_bytes_or = catalog.page(filter_page_id);
+        if (f_bytes_or.has_value()) {
+          auto fv_or = format::parse_bloom_filter_page(*f_bytes_or);
+          if (fv_or.has_value() && !fv_or->might_contain(key)) {
+            return std::unexpected{Status{ErrorCode::kNotFound}};
+          }
+        }
+        // If the filter page can't be parsed we fall through and read the
+        // leaf — filter is an optimization, not a source of truth.
+      }
+
       page_id = nv_or->child_page_id(pivot_i);
       continue;
     }

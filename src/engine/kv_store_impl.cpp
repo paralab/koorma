@@ -286,9 +286,17 @@ Status KVStore::force_checkpoint() {
   auto* leaf_file = impl_->catalog.page_file(kPhase3LeafDevice);
   if (leaf_file == nullptr) return Status{ErrorCode::kInternal};
 
+  // Filters: on when compile-time KOORMA_USE_BLOOM_FILTER is set AND the
+  // tree options' bits_per_key is non-zero. Setting bits_per_key to 0 is a
+  // runtime override (used by tests + bench to disable filters).
+#ifdef KOORMA_USE_BLOOM_FILTER
+  const std::size_t filter_bpk = impl_->tree_options.filter_bits_per_key();
+#else
+  const std::size_t filter_bpk = 0;
+#endif
   auto new_root_or = engine::flush_memtable_to_checkpoint(
       impl_->memtable, impl_->allocator, kPhase3LeafDevice, *leaf_file,
-      impl_->tree_options.leaf_size());
+      impl_->tree_options.leaf_size(), filter_bpk);
   if (!new_root_or.has_value()) return new_root_or.error();
 
   impl_->manifest.root_page_id = *new_root_or;
