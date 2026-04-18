@@ -57,6 +57,22 @@ StatusOr<ValueView> get(const io::PageCatalog& catalog, std::uint64_t root_page_
     if (hdr.layout_id == format::kNodePageLayoutId) {
       auto nv_or = NodeView::parse(bytes);
       if (!nv_or.has_value()) return std::unexpected{nv_or.error()};
+
+      // Phase 8: root-level update buffer check. Buffer entries shadow
+      // anything below; a tombstone here hides the key entirely.
+      // (Only the root node carries a buffer in this phase, but the probe
+      // is cheap enough to do at every depth in case future phases extend
+      // buffers to lower levels.)
+      if (!nv_or->root_buffer().empty()) {
+        const auto be = nv_or->root_buffer().find(key);
+        if (be.has_value()) {
+          if (be->op == ValueView::OP_DELETE) {
+            return std::unexpected{Status{ErrorCode::kNotFound}};
+          }
+          return ValueView::from_packed(be->op, be->value);
+        }
+      }
+
       const std::size_t pivot_i = nv_or->route(key);
 
       // Filter check: if the parent recorded a filter for this child,
@@ -146,10 +162,102 @@ bool scan_subtree(const io::PageCatalog& catalog, std::uint64_t page_id,
 
 }  // namespace
 
+namespace {
+
+// Materialize root-buffer entries into a sorted vector of owned strings,
+// filtered to those with key >= min_key.
+struct OwnedBufferEntry {
+  ValueView::OpCode op;
+  std::string key;
+  std::string value;
+};
+
+std::vector<OwnedBufferEntry> materialize_buffer(
+    const format::RootBufferView& view, const KeyView& min_key) noexcept {
+  std::vector<OwnedBufferEntry> out;
+  out.reserve(view.entry_count());
+  for (std::uint32_t i = 0; i < view.entry_count(); ++i) {
+    auto e = view.decode_at(i);
+    if (!e.has_value()) break;
+    if (e->key < min_key) continue;
+    out.push_back({e->op, std::string(e->key), std::string(e->value)});
+  }
+  return out;
+}
+
+}  // namespace
+
 Status scan_tree(const io::PageCatalog& catalog, std::uint64_t root_page_id,
                  const KeyView& min_key, const ScanCallback& cb) noexcept {
+  // Fast path: no root buffer, or root is a leaf — walk as before.
+  auto bytes_or = catalog.page(root_page_id);
+  if (!bytes_or.has_value()) return bytes_or.error();
+  const auto bytes = *bytes_or;
+  if (bytes.size() < sizeof(format::PackedPageHeader)) {
+    return Status{ErrorCode::kCorruption};
+  }
+  const auto& hdr =
+      *reinterpret_cast<const format::PackedPageHeader*>(bytes.data());
+
+  std::vector<OwnedBufferEntry> buf;
+  if (hdr.layout_id == format::kNodePageLayoutId) {
+    auto nv_or = NodeView::parse(bytes);
+    if (!nv_or.has_value()) return nv_or.error();
+    if (!nv_or->root_buffer().empty()) {
+      buf = materialize_buffer(nv_or->root_buffer(), min_key);
+    }
+  }
+
   Status status{};
-  scan_subtree(catalog, root_page_id, min_key, /*is_leftmost=*/true, cb, &status);
+
+  if (buf.empty()) {
+    scan_subtree(catalog, root_page_id, min_key, /*is_leftmost=*/true, cb, &status);
+    return status;
+  }
+
+  // Merge path: interleave `buf` (sorted by key) with the child scan
+  // stream. Buffer entries shadow child entries with equal keys —
+  // whatever the buffer says (including tombstones) wins, and the
+  // callback sees one entry per unique key.
+  std::size_t bi = 0;
+  bool halt = false;
+  auto wrapped = [&](const KeyView& k, const ValueView& v) -> bool {
+    // Flush buffer entries strictly less than k.
+    while (bi < buf.size() && KeyView{buf[bi].key} < k) {
+      if (!cb(KeyView{buf[bi].key},
+              ValueView::from_packed(buf[bi].op, buf[bi].value))) {
+        halt = true;
+        return false;
+      }
+      ++bi;
+    }
+    if (bi < buf.size() && KeyView{buf[bi].key} == k) {
+      // Buffer shadows child: emit buffer's entry, skip child's.
+      const bool keep =
+          cb(KeyView{buf[bi].key},
+             ValueView::from_packed(buf[bi].op, buf[bi].value));
+      ++bi;
+      if (!keep) {
+        halt = true;
+        return false;
+      }
+      return true;
+    }
+    return cb(k, v);
+  };
+
+  scan_subtree(catalog, root_page_id, min_key, /*is_leftmost=*/true, wrapped, &status);
+  if (halt || !status.ok()) return status;
+
+  // Drain remaining buffer entries (with keys greater than anything we
+  // got from the child scan).
+  while (bi < buf.size()) {
+    if (!cb(KeyView{buf[bi].key},
+            ValueView::from_packed(buf[bi].op, buf[bi].value))) {
+      break;
+    }
+    ++bi;
+  }
   return status;
 }
 

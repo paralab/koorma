@@ -11,6 +11,7 @@ target_sources(koorma_core PRIVATE
   io/page_catalog.cpp
   mem/memtable.cpp
   format/bloom_filter.cpp
+  format/root_buffer.cpp
   tree/leaf_view.cpp
   tree/leaf_builder.cpp
   tree/node_view.cpp

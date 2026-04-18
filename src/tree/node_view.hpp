@@ -1,6 +1,7 @@
 #pragma once
 
 #include "format/packed_node.hpp"
+#include "format/root_buffer.hpp"
 
 #include <koorma/key_view.hpp>
 #include <koorma/status.hpp>
@@ -34,9 +35,19 @@ class NodeView {
   // "no filter". Returns 0 if the node was built without filter_physicals.
   std::uint32_t filter_physical_for(std::size_t pivot_i) const noexcept;
 
+  // Phase 8: the node's optional koorma-private root buffer. Returns an
+  // empty view if no buffer is present. Backed by the page bytes — the
+  // view is valid for the lifetime of the page mapping.
+  format::RootBufferView root_buffer() const noexcept {
+    return root_buffer_view_;
+  }
+
  private:
-  explicit NodeView(const format::PackedNodePage* node) noexcept : node_{node} {}
+  NodeView(const format::PackedNodePage* node,
+           format::RootBufferView buffer) noexcept
+      : node_{node}, root_buffer_view_{buffer} {}
   const format::PackedNodePage* node_;
+  format::RootBufferView root_buffer_view_;
 };
 
 }  // namespace koorma::tree

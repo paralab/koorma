@@ -8,7 +8,7 @@ Design rationale and all architectural choices live in
 [**DECISIONS.md**](./DECISIONS.md). On-disk byte layouts live in
 [**FORMAT.md**](./FORMAT.md). This README tracks *status*.
 
-## Status (as of Phase 7)
+## Status (as of Phase 8)
 
 | # | Phase | Status | Highlights |
 |---|---|---|---|
@@ -19,18 +19,21 @@ Design rationale and all architectural choices live in
 | 5 | Multi-level trees + TSAN + bench | ✅ done | Height up to 6 (≈6.8 × 10¹⁰ leaves), **0 TSAN races across 89 concurrent-path tests**, bench baseline captured |
 | 6 | Bloom filters + walker integration | ✅ done | Per-leaf `PackedBloomFilterPage`, parent node stores filter IDs in `segment_filters`, walker short-circuits on filter miss — **+20–26 % on missing-key `get()`** |
 | 7 | Persistent multi-checkpoint + reclamation | ✅ done | Fixed silent data loss across checkpoints (merge old tree + memtable), per-device free list in the manifest, `allocate()` prefers freed slots; `next_physical` now plateaus over many checkpoints |
+| 8 | Root-level update buffer | ✅ done | Small-batch checkpoints absorb into the root node's buffer instead of rebuilding leaves — **O(root page) per checkpoint** for typical churn. Walker probes buffer before routing; `scan_tree` merges buffer with child scan. Koorma-private buffer encoding (turtle_kv `PackedUpdateBuffer` reinterpretation still deferred). |
 
-**Totals**: 5,972 LoC across 72 files · 64 gtest cases · 0 data races under `-fsanitize=thread` (Phase 5 verification; subsequent changes are guarded by the existing `engine_mutex`, unchanged concurrency surface).
+**Totals**: 7,007 LoC across 76 files · 73 gtest cases · 0 data races under `-fsanitize=thread` (Phase 5 verification; subsequent changes are guarded by the existing `engine_mutex`, unchanged concurrency surface).
 
 ## What works right now
 
 - `KVStore::create(dir, config, RemoveExisting)` / `open(dir, tree_options)`
 - `put(key, value)` / `get(key)` / `remove(key)` / `scan(min_key, items_out)`
-- `force_checkpoint()` — merges the memtable with the existing tree (if any)
-  and flushes the combined state to disk as one or more leaf pages (with
-  internal nodes above them, plus a companion Bloom filter page per leaf
-  when filters are enabled). Old pages are released back to a per-device
-  free list that survives a reopen.
+- `force_checkpoint()` — first tries the **incremental** path: merges the
+  memtable into the root node's update buffer and rewrites just the root
+  page, reusing the children (O(root page) per checkpoint). If the merged
+  buffer overflows, falls back to a **full-rebuild** path: merge memtable
+  with a scan of the existing tree, then build a new tree from scratch.
+  Old pages are released back to a per-device free list that survives a
+  reopen.
 - Concurrent `put`/`get`/`remove` from many threads (sharded memtable)
 - **Bloom filters on the read path** — `get()` on a missing key short-
   circuits at the parent node without touching the leaf. Runtime-toggleable
@@ -45,16 +48,17 @@ Design rationale and all architectural choices live in
 
 ## What's deferred
 
-(See [DECISIONS.md §15](./DECISIONS.md#15-phase-7-scope-notes) for full rationale.)
+(See [DECISIONS.md §16](./DECISIONS.md#16-phase-8-scope-notes) for full rationale.)
 
 - **LLFS `Volume` directory layout** — koorma currently reads/writes its own
   `koorma.manifest` bootstrap format. Opening databases written by real
   turtle_kv requires reverse-engineering LLFS's slotted-log + volume root.
-- **Incremental update buffers** — koorma's checkpoint rebuilds the whole
-  tree by merging the old root with the memtable (O(DB size) per
-  checkpoint). Turtle_kv's actual design batches edits into internal-node
-  update buffers and flushes them down level-by-level; wiring that in
-  would move us from O(DB) to O(memtable) per checkpoint.
+- **Multi-level update buffers** — Phase 8 buffers only at the root. Real
+  turtle_kv buffers at every internal node and flushes level-by-level
+  when a node's buffer saturates (B-epsilon tree semantics). Koorma
+  overflows into a full rebuild instead. Wiring the real flush algorithm
+  would also switch our buffer codec from the koorma-private footer to
+  turtle_kv's `PackedUpdateBuffer` / `PackedSegment` layout.
 - **xxh3-compatible filter contents** — koorma writes the LLFS bloom-filter
   *frame* format, but the bit positions are computed from `absl::Hash`
   rather than xxh3. Real turtle_kv filter pages would need xxh3 to probe.

@@ -8,12 +8,15 @@
 #include "format/packed_page_id.hpp"
 #include "format/packed_value_offset.hpp"
 #include "format/page_layout.hpp"
+#include "format/page_layout_id.hpp"
 #include "tree/leaf_builder.hpp"
 #include "tree/node_builder.hpp"
+#include "tree/node_view.hpp"
 
 #include <koorma/key_view.hpp>
 
 #include <cstddef>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -222,6 +225,87 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
   return flush_sorted_snapshot_to_checkpoint(snapshot, allocator, leaf_device_id,
                                              leaf_file, leaf_size,
                                              filter_bits_per_key);
+}
+
+StatusOr<std::uint64_t> try_incremental_checkpoint(
+    const io::PageCatalog& catalog,
+    std::uint64_t old_root_page_id,
+    std::span<const format::RootBufferEntry> entries,
+    PageAllocator& allocator,
+    std::uint32_t leaf_device_id,
+    io::PageFile& leaf_file,
+    std::uint32_t leaf_size) noexcept {
+  using namespace koorma::format;
+
+  if (!leaf_file.is_writable()) {
+    return std::unexpected{Status{ErrorCode::kFailedPrecondition}};
+  }
+
+  // Load the old root; incremental path only applies if it's an internal
+  // node. A leaf root has no children to preserve — full rebuild is
+  // cheaper than buffering above a single leaf.
+  auto bytes_or = catalog.page(old_root_page_id);
+  if (!bytes_or.has_value()) return std::unexpected{bytes_or.error()};
+  const auto bytes = *bytes_or;
+  if (bytes.size() < sizeof(PackedPageHeader)) {
+    return std::unexpected{Status{ErrorCode::kCorruption}};
+  }
+  const auto& hdr =
+      *reinterpret_cast<const PackedPageHeader*>(bytes.data());
+  if (!(hdr.layout_id == kNodePageLayoutId)) {
+    return std::unexpected{Status{ErrorCode::kInvalidArgument}};
+  }
+
+  auto nv_or = tree::NodeView::parse(bytes);
+  if (!nv_or.has_value()) return std::unexpected{nv_or.error()};
+  const auto& old_node = *nv_or;
+
+  // Rebuild the pivot list from the old node.
+  const std::size_t n_pivots = old_node.pivot_count();
+  std::vector<std::pair<KeyView, std::uint64_t>> pivots;
+  pivots.reserve(n_pivots);
+  for (std::size_t i = 0; i < n_pivots; ++i) {
+    pivots.emplace_back(old_node.pivot_at(i), old_node.child_page_id(i));
+  }
+  // max_key for the new node: the pivot sentinel at index n_pivots in
+  // the trailer.
+  const KeyView max_key = [&]() -> KeyView {
+    // Reach into the packed layout — `pivot_keys_[n_pivots]` is the
+    // max-key sentinel (see node_builder comments).
+    const auto* node = reinterpret_cast<const PackedNodePage*>(
+        bytes.data() + sizeof(PackedPageHeader));
+    const auto& here = node->pivot_keys_[n_pivots];
+    const auto& next = node->pivot_keys_[n_pivots + 1];
+    const char* data = here.pointer.get();
+    const char* end = next.pointer.get();
+    if (data == nullptr || end == nullptr || end < data) return KeyView{};
+    return KeyView{data, static_cast<std::size_t>(end - data)};
+  }();
+
+  // Allocate a new root and try to build it with the entries buffer.
+  auto new_id_or = allocator.allocate(leaf_device_id);
+  if (!new_id_or.has_value()) return std::unexpected{new_id_or.error()};
+  const std::uint64_t new_id = *new_id_or;
+  const std::uint32_t new_phys = page_id_physical(new_id);
+  auto dst = leaf_file.mutable_page(new_phys);
+
+  auto st = tree::build_node_page(
+      dst, new_id, old_node.height(), pivots, max_key,
+      /*filter_physicals=*/{}, entries);
+  if (!st.ok()) {
+    // Build failed (most commonly kResourceExhausted). The allocated
+    // page is wasted — release it back to the free list so the full-
+    // rebuild caller doesn't blow through capacity.
+    allocator.release(leaf_device_id, new_phys);
+    return std::unexpected{st};
+  }
+
+  auto sync = leaf_file.sync();
+  if (!sync.ok()) return std::unexpected{sync};
+
+  (void)leaf_size;  // leaf_size threaded through for a future incremental
+                    // flush path; Phase 8 only touches the root page.
+  return new_id;
 }
 
 }  // namespace koorma::engine

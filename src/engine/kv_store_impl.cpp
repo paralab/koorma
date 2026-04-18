@@ -2,8 +2,12 @@
 #include "engine/manifest.hpp"
 #include "engine/page_allocator.hpp"
 #include "format/packed_page_id.hpp"
+#include "format/page_layout.hpp"
+#include "format/page_layout_id.hpp"
+#include "format/root_buffer.hpp"
 #include "io/page_catalog.hpp"
 #include "mem/memtable.hpp"
+#include "tree/node_view.hpp"
 #include "tree/walker.hpp"
 
 #include <koorma/kv_store.hpp>
@@ -363,6 +367,65 @@ build_merged_snapshot(const mem::Memtable& memtable,
   return out;
 }
 
+// Collect the existing root-buffer entries (if any) into an owned vector.
+// Empty if the root is not a node or has no buffer.
+std::vector<format::RootBufferEntry> collect_root_buffer(
+    io::PageCatalog& catalog, std::uint64_t root_page_id) {
+  std::vector<format::RootBufferEntry> out;
+  if (root_page_id == engine::kEmptyTreeRoot) return out;
+  auto bytes_or = catalog.page(root_page_id);
+  if (!bytes_or.has_value()) return out;
+  const auto bytes = *bytes_or;
+  if (bytes.size() < sizeof(format::PackedPageHeader)) return out;
+  const auto& hdr =
+      *reinterpret_cast<const format::PackedPageHeader*>(bytes.data());
+  if (!(hdr.layout_id == format::kNodePageLayoutId)) return out;
+  auto nv_or = tree::NodeView::parse(bytes);
+  if (!nv_or.has_value()) return out;
+  const auto& buf = nv_or->root_buffer();
+  out.reserve(buf.entry_count());
+  for (std::uint32_t i = 0; i < buf.entry_count(); ++i) {
+    auto e = buf.decode_at(i);
+    if (!e.has_value()) break;
+    out.push_back({e->op, std::string(e->key), std::string(e->value)});
+  }
+  return out;
+}
+
+// Merge the old root buffer with a memtable snapshot. Both are sorted.
+// Memtable shadows on equal keys. Tombstones are PRESERVED (unlike the
+// full-rebuild merge) — the new root buffer needs them to shadow the
+// still-live tree below.
+std::vector<format::RootBufferEntry> merge_for_incremental(
+    std::vector<format::RootBufferEntry> old_buf,
+    const std::vector<std::pair<std::string, mem::Memtable::Slot>>& mt) {
+  std::vector<format::RootBufferEntry> out;
+  out.reserve(old_buf.size() + mt.size());
+  std::size_t ob = 0, mi = 0;
+  while (ob < old_buf.size() && mi < mt.size()) {
+    auto& o = old_buf[ob];
+    auto& m = mt[mi];
+    if (o.key == m.first) {
+      out.push_back({m.second.op, std::move(old_buf[ob].key),
+                     std::move(m.second.body)});
+      ++ob;
+      ++mi;
+    } else if (o.key < m.first) {
+      out.push_back(std::move(o));
+      ++ob;
+    } else {
+      out.push_back({m.second.op, m.first, std::move(m.second.body)});
+      ++mi;
+    }
+  }
+  while (ob < old_buf.size()) out.push_back(std::move(old_buf[ob++]));
+  while (mi < mt.size()) {
+    auto& m = mt[mi++];
+    out.push_back({m.second.op, m.first, std::move(m.second.body)});
+  }
+  return out;
+}
+
 }  // namespace
 
 Status KVStore::force_checkpoint() {
@@ -380,24 +443,55 @@ Status KVStore::force_checkpoint() {
 
   const std::uint64_t old_root = impl_->manifest.root_page_id;
 
-  // Merge memtable with existing tree (if any) into a single sorted stream
-  // of live entries. This is a full-rebuild compaction — O(DB size) per
-  // checkpoint; a proper incremental upsert path is future work.
-  auto merged_or =
-      build_merged_snapshot(impl_->memtable, impl_->catalog, old_root);
-  if (!merged_or.has_value()) return merged_or.error();
-  const auto& merged = *merged_or;
+  std::uint64_t new_root = engine::kEmptyTreeRoot;
+  bool did_incremental = false;
 
-  std::uint64_t new_root;
-  if (merged.empty()) {
-    // Everything got deleted. New tree is empty.
-    new_root = engine::kEmptyTreeRoot;
-  } else {
-    auto new_root_or = engine::flush_sorted_snapshot_to_checkpoint(
-        merged, impl_->allocator, kPhase3LeafDevice, *leaf_file,
-        impl_->tree_options.leaf_size(), filter_bpk);
-    if (!new_root_or.has_value()) return new_root_or.error();
-    new_root = *new_root_or;
+  // --- Try the incremental (root-buffer-append) path first -----------
+  //
+  // Applicable when: (a) old root exists and is an internal node, and
+  // (b) the combined (existing root buffer + memtable) fits in a new
+  // root page's trailer. On success, children are untouched — only the
+  // root page is rewritten, so checkpoint cost is O(root size).
+  if (old_root != engine::kEmptyTreeRoot) {
+    auto bytes_or = impl_->catalog.page(old_root);
+    const bool root_is_node =
+        bytes_or.has_value() &&
+        bytes_or->size() >= sizeof(format::PackedPageHeader) &&
+        reinterpret_cast<const format::PackedPageHeader*>(bytes_or->data())
+                ->layout_id == format::kNodePageLayoutId;
+    if (root_is_node) {
+      auto old_buf = collect_root_buffer(impl_->catalog, old_root);
+      auto mt_snap = impl_->memtable.merged_snapshot();
+      auto merged_entries =
+          merge_for_incremental(std::move(old_buf), mt_snap);
+
+      auto inc_or = engine::try_incremental_checkpoint(
+          impl_->catalog, old_root, merged_entries, impl_->allocator,
+          kPhase3LeafDevice, *leaf_file,
+          impl_->tree_options.leaf_size());
+      if (inc_or.has_value()) {
+        new_root = *inc_or;
+        did_incremental = true;
+      }
+      // Else: fall through to full rebuild.
+    }
+  }
+
+  // --- Full-rebuild fallback (Phase 7 path) --------------------------
+  if (!did_incremental) {
+    auto merged_or =
+        build_merged_snapshot(impl_->memtable, impl_->catalog, old_root);
+    if (!merged_or.has_value()) return merged_or.error();
+    const auto& merged = *merged_or;
+    if (merged.empty()) {
+      new_root = engine::kEmptyTreeRoot;
+    } else {
+      auto new_root_or = engine::flush_sorted_snapshot_to_checkpoint(
+          merged, impl_->allocator, kPhase3LeafDevice, *leaf_file,
+          impl_->tree_options.leaf_size(), filter_bpk);
+      if (!new_root_or.has_value()) return new_root_or.error();
+      new_root = *new_root_or;
+    }
   }
 
   // Swap root + push allocator state into the manifest before reclamation,
@@ -405,17 +499,25 @@ Status KVStore::force_checkpoint() {
   // reclamation step aborts partway through.
   impl_->manifest.root_page_id = new_root;
 
-  // Reclaim old tree pages (if any). This is safe under unique_lock —
-  // no concurrent reader is mid-walk on the old tree.
+  // Reclaim old tree pages:
+  //   - Incremental: only the old root page is orphaned (children still
+  //     referenced from the new root).
+  //   - Full rebuild: the entire old subtree is orphaned.
   if (old_root != engine::kEmptyTreeRoot) {
-    std::vector<std::uint64_t> old_pages;
-    auto collect_st =
-        tree::collect_pages(impl_->catalog, old_root, old_pages);
-    if (!collect_st.ok()) return collect_st;
-    for (const auto id : old_pages) {
-      const std::uint32_t dev = format::page_id_device(id);
-      const std::uint32_t phys = format::page_id_physical(id);
+    if (did_incremental) {
+      const std::uint32_t dev = format::page_id_device(old_root);
+      const std::uint32_t phys = format::page_id_physical(old_root);
       impl_->allocator.release(dev, phys);
+    } else {
+      std::vector<std::uint64_t> old_pages;
+      auto collect_st =
+          tree::collect_pages(impl_->catalog, old_root, old_pages);
+      if (!collect_st.ok()) return collect_st;
+      for (const auto id : old_pages) {
+        const std::uint32_t dev = format::page_id_device(id);
+        const std::uint32_t phys = format::page_id_physical(id);
+        impl_->allocator.release(dev, phys);
+      }
     }
   }
 

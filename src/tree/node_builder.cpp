@@ -10,16 +10,22 @@
 
 namespace koorma::tree {
 
-Status build_node_page(std::span<std::uint8_t> out, std::uint64_t page_id, std::uint8_t height,
-                       std::span<const std::pair<KeyView, std::uint64_t>> pivots,
-                       const KeyView& max_key,
-                       std::span<const std::uint32_t> filter_physicals) noexcept {
+Status build_node_page(
+    std::span<std::uint8_t> out, std::uint64_t page_id, std::uint8_t height,
+    std::span<const std::pair<KeyView, std::uint64_t>> pivots,
+    const KeyView& max_key,
+    std::span<const std::uint32_t> filter_physicals,
+    std::span<const format::RootBufferEntry> buffer_entries) noexcept {
   using namespace koorma::format;
 
   if (pivots.empty() || pivots.size() > kMaxPivots) {
     return Status{ErrorCode::kInvalidArgument};
   }
   if (!filter_physicals.empty() && filter_physicals.size() != pivots.size()) {
+    return Status{ErrorCode::kInvalidArgument};
+  }
+  if (!filter_physicals.empty() && !buffer_entries.empty()) {
+    // See DECISIONS §16: filters and root buffers share trailer space.
     return Status{ErrorCode::kInvalidArgument};
   }
   if (out.size() < sizeof(PackedPageHeader) + sizeof(PackedNodePage)) {
@@ -135,9 +141,37 @@ Status build_node_page(std::span<std::uint8_t> out, std::uint64_t page_id, std::
     trailer_write += array_bytes;
   }
 
+  // --- root buffer (optional) -------------------------------------------
+  // Place buffer entries in the trailer after pivot keys, then write the
+  // 16-byte magic footer at the very end of the page. The footer's
+  // data_begin is the absolute byte offset within the page where entries
+  // start.
+  if (!buffer_entries.empty()) {
+    const std::size_t need = encoded_size(buffer_entries);
+    auto* footer_begin = out.data() + out.size() - kRootBufferFooterSize;
+    if (trailer_write + need > footer_begin) {
+      return Status{ErrorCode::kResourceExhausted};
+    }
+    const std::size_t data_begin_abs = static_cast<std::size_t>(
+        reinterpret_cast<std::uintptr_t>(trailer_write) -
+        reinterpret_cast<std::uintptr_t>(out.data()));
+    auto enc = encode(std::span<std::uint8_t>{trailer_write, need},
+                      buffer_entries);
+    if (!enc.ok()) return enc;
+
+    auto& footer = *reinterpret_cast<RootBufferFooter*>(footer_begin);
+    footer.magic = kRootBufferMagic;
+    footer.data_begin = static_cast<std::uint32_t>(data_begin_abs);
+    footer.entry_count = static_cast<std::uint32_t>(buffer_entries.size());
+
+    trailer_write += need;
+  }
+
   hdr.unused_begin =
       static_cast<std::uint32_t>(node_offset + (trailer_write - reinterpret_cast<std::uint8_t*>(&node)));
-  hdr.unused_end = static_cast<std::uint32_t>(out.size());
+  hdr.unused_end = static_cast<std::uint32_t>(
+      buffer_entries.empty() ? out.size()
+                             : out.size() - kRootBufferFooterSize);
 
   hdr.crc32 = std::uint32_t{0};
   hdr.crc32 = io::crc32c(out.data(), out.size());

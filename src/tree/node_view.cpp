@@ -3,6 +3,7 @@
 #include "format/packed_array.hpp"
 #include "format/page_layout.hpp"
 #include "format/page_layout_id.hpp"
+#include "format/root_buffer.hpp"
 
 #include <algorithm>
 
@@ -25,7 +26,9 @@ StatusOr<NodeView> NodeView::parse(std::span<const std::uint8_t> page_bytes) noe
     return std::unexpected{Status{ErrorCode::kCorruption}};
   }
 
-  return NodeView{node};
+  auto buf_or = parse_root_buffer(page_bytes);
+  if (!buf_or.has_value()) return std::unexpected{buf_or.error()};
+  return NodeView{node, *buf_or};
 }
 
 KeyView NodeView::pivot_at(std::size_t i) const noexcept {
@@ -46,6 +49,9 @@ std::uint64_t NodeView::child_page_id(std::size_t pivot_i) const noexcept {
 
 std::uint32_t NodeView::filter_physical_for(std::size_t pivot_i) const noexcept {
   using namespace koorma::format;
+  // When a root buffer is present, the filter-id array is not emitted
+  // (they'd share trailer space — see DECISIONS §16). Don't probe.
+  if (!root_buffer_view_.empty()) return 0;
   const auto* arr = node_->update_buffer.segment_filters.get();
   if (arr == nullptr) return 0;
   if (pivot_i >= arr->size()) return 0;

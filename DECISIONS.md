@@ -365,6 +365,71 @@ as Phase 1 lands).
   separate 4 KiB node arena vs. 2 MiB leaf arena, xxh3-compatible
   filter content, VQF filter write path, binary free-list sidecar.
 
+## 16. Phase 8 scope notes
+
+- **Root-level update buffer.** Memtable entries now optionally land in
+  the root node's pending-update buffer rather than triggering a full
+  tree rebuild. When a checkpoint fires, `force_checkpoint` first tries
+  the incremental path: merge (old root's buffer + memtable) → write a
+  new root page with the merged entries in its trailer → leave the
+  children untouched. If the merged entries don't fit, fall back to the
+  Phase 7 full-rebuild.
+- **What this gets us.** Checkpoint cost for the common case
+  (small-batch churn on a large DB) drops from `O(DB size)` to
+  `O(root page size)` — just one page written per checkpoint plus the
+  old root released to the free list.
+- **What it doesn't get us.** Koorma only buffers at the ROOT. Real
+  turtle_kv B-epsilon trees buffer at EVERY internal node and flush
+  level-by-level when a node's buffer saturates. Our buffer overflow
+  path is a full rebuild, not a one-level flush. Multi-level buffer
+  flushing is still deferred — this phase deliberately keeps the scope
+  to one node.
+- **Encoding: koorma-private, NOT turtle_kv-compatible.** We don't use
+  the `PackedUpdateBuffer` struct (which bundles `PackedSegment[]` +
+  `segment_filters` + `level_start[]` — designed for multi-level
+  flushes). Instead, at the end of the root page, we write a 16-byte
+  footer with a magic number (`"kormaBuf"` as `big_u64 0x6b6f726d61427566`),
+  a `data_begin` offset into the page, and an entry count. Entries live
+  just after the pivot keys in the trailer, packed as
+  `op(u8) key_len(u16) val_len(u32) key_bytes val_bytes`, sorted by key.
+  The footer sits past `unused_begin`, so a real turtle_kv reader simply
+  sees an empty-buffer node and ignores us.
+- **Filter / buffer coexistence.** Phase 6's per-leaf filter-ID array
+  and the Phase 8 root buffer both want trailer space. The simple rule:
+  **a node has one or the other, never both.** Incremental checkpoints
+  disable the per-leaf filter array at the root when a buffer is
+  present; leaves below still have their filter pages on disk but are
+  not probed via the parent. Full-rebuild checkpoints retain Phase 6's
+  filter wiring (no buffer on the new root — memtable is already
+  merged into leaves).
+- **Walker integration.** `NodeView::root_buffer()` returns the
+  optional view. `tree::get()` probes the buffer before routing at
+  every node (cheap enough; only the root has a non-empty buffer in
+  Phase 8). On a hit — value *or* tombstone — it short-circuits.
+  `tree::scan_tree()` materializes the root buffer, filters by
+  `min_key`, then merges it with the child-scan callback: buffer
+  entries shadow same-key child entries and are emitted in sorted
+  order.
+- **Reclamation semantics.** Incremental path: only the OLD root page
+  is released (children stay live). Full-rebuild path: entire old
+  subtree is walked + released, as in Phase 7.
+- **Overflow trigger.** We don't have a fixed threshold. `build_node_page`
+  simply refuses to encode if entries + pivot keys don't fit in the
+  trailer; the caller catches `kResourceExhausted` and falls back to a
+  full rebuild. In practice this caps root buffers at roughly 40–100
+  small entries (depends on pivot key sizes), so full rebuilds fire
+  once per ~50 checkpoints of a typical churn pattern.
+- **Concurrency.** Same engine_mutex discipline as before — readers
+  take `shared_lock`, checkpoint takes `unique_lock`. Root-buffer
+  `ValueView`s emitted from `get()` point into the mmapped new-root
+  page, which remains valid until the *next* checkpoint releases it —
+  and by then a fresh shared_lock acquirer would see the new root.
+- **Still deferred to future phases**: multi-level update buffers (the
+  actual turtle_kv flush algorithm), proper `PackedUpdateBuffer`/
+  `PackedSegment` interpretation, LLFS `Volume` layout, WAL, separate
+  node-arena vs. leaf-arena, xxh3-compatible filter content, VQF
+  write path, binary free-list sidecar.
+
 ## 13. Change log
 
 - 2026-04-17: Initial document. Locked choices 3.1–3.5. Phase 1 done.
@@ -384,3 +449,8 @@ as Phase 1 lands).
   existing tree with memtable before rebuilding) + page reclamation
   via free list in the manifest. 64 tests passing. `next_physical`
   now plateaus over many checkpoints of a fixed working set.
+- 2026-04-18: Phase 8 done — root-level update buffer. Small-batch
+  checkpoints now rewrite only the root page, leaving children intact;
+  oversized batches fall back to full rebuild. 73 tests passing.
+  Walker probes the buffer before routing; `scan_tree` merges buffer
+  entries with the child scan in sorted order.

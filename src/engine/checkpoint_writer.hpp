@@ -1,6 +1,8 @@
 #pragma once
 
 #include "engine/page_allocator.hpp"
+#include "format/root_buffer.hpp"
+#include "io/page_catalog.hpp"
 #include "io/page_file.hpp"
 #include "mem/memtable.hpp"
 
@@ -40,5 +42,29 @@ StatusOr<std::uint64_t> flush_memtable_to_checkpoint(
     io::PageFile& leaf_file,
     std::uint32_t leaf_size,
     std::size_t filter_bits_per_key = 0) noexcept;
+
+// Phase 8: incremental checkpoint. Attempt to write a new root node whose
+// pending-update buffer carries `entries` (memtable entries merged with
+// any entries from the OLD root's existing buffer). The existing tree
+// below the root is reused as-is — its pages stay live.
+//
+// Returns:
+//   - new root page id on success.
+//   - std::unexpected(kResourceExhausted) if entries don't fit in a
+//     single node-trailer buffer (caller should fall back to full
+//     rebuild).
+//   - std::unexpected(kInvalidArgument) if the old root isn't an internal
+//     node (no point buffering above a single leaf — caller rebuilds).
+//
+// IMPORTANT: this does NOT release the old root's page. The caller is
+// responsible for releasing the old root after the manifest swap.
+StatusOr<std::uint64_t> try_incremental_checkpoint(
+    const io::PageCatalog& catalog,
+    std::uint64_t old_root_page_id,
+    std::span<const format::RootBufferEntry> entries,
+    PageAllocator& allocator,
+    std::uint32_t leaf_device_id,
+    io::PageFile& leaf_file,
+    std::uint32_t leaf_size) noexcept;
 
 }  // namespace koorma::engine

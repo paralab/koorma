@@ -1,5 +1,7 @@
 #pragma once
 
+#include "format/root_buffer.hpp"
+
 #include <koorma/key_view.hpp>
 #include <koorma/status.hpp>
 
@@ -37,9 +39,18 @@ namespace koorma::tree {
 // for this child"). These are written as a `PackedArray<little_u32>` in
 // the trailer right after the pivot keys, and `update_buffer.segment_filters`
 // is pointed at it. NodeView::filter_physical_for(child_i) reads them back.
-Status build_node_page(std::span<std::uint8_t> out, std::uint64_t page_id, std::uint8_t height,
-                       std::span<const std::pair<KeyView, std::uint64_t>> pivots,
-                       const KeyView& max_key,
-                       std::span<const std::uint32_t> filter_physicals = {}) noexcept;
+//
+// If `buffer_entries` is non-empty, the root-buffer codec encodes the
+// entries at the end of the trailer and writes the 16-byte magic footer
+// at the last 16 bytes of the page. When a buffer is written,
+// `filter_physicals` MUST be empty — the two features share trailer
+// space and Phase 8 doesn't mix them (see DECISIONS §16).
+// Returns kResourceExhausted if the buffer doesn't fit.
+Status build_node_page(
+    std::span<std::uint8_t> out, std::uint64_t page_id, std::uint8_t height,
+    std::span<const std::pair<KeyView, std::uint64_t>> pivots,
+    const KeyView& max_key,
+    std::span<const std::uint32_t> filter_physicals = {},
+    std::span<const format::RootBufferEntry> buffer_entries = {}) noexcept;
 
 }  // namespace koorma::tree
